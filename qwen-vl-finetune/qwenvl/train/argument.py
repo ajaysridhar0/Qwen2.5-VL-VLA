@@ -36,3 +36,9 @@ class TrainingArguments(transformers.TrainingArguments):
     )
     mm_projector_lr: Optional[float] = None
     vision_tower_lr: Optional[float] = None
+    # AdamW optimizer beta parameters
+    adam_beta1: float = field(default=0.9, metadata={"help": "Beta1 parameter for AdamW optimizer"})
+    adam_beta2: float = field(default=0.999, metadata={"help": "Beta2 parameter for AdamW optimizer"})
+    # EMA parameters
+    use_ema: bool = field(default=False, metadata={"help": "Whether to use Exponential Moving Average"})
+    ema_decay: float = field(default=0.999, metadata={"help": "EMA decay rate"})

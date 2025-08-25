@@ -1,5 +1,6 @@
 import os
 from typing import Dict, List, Optional, Sequence
+import copy
 
 import datasets
 import torch
@@ -209,6 +210,58 @@ def print_trainable_parameters(self) -> None:
     )
 
 
+class EMATrainer(Trainer):
+    """Custom trainer with Exponential Moving Average (EMA) support."""
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.ema_model = None
+        self.ema_decay = getattr(self.args, 'ema_decay', 0.999)
+        self.use_ema = getattr(self.args, 'use_ema', False)
+        self._ema_initialized = False
+    
+    def _init_ema(self):
+        """Initialize EMA model."""
+        if self.model is not None:
+            self.ema_model = copy.deepcopy(self.model)
+            for param in self.ema_model.parameters():
+                param.requires_grad = False
+    
+    def _update_ema(self):
+        """Update EMA model weights."""
+        if not self.use_ema or self.ema_model is None:
+            return
+            
+        with torch.no_grad():
+            for ema_param, model_param in zip(self.ema_model.parameters(), self.model.parameters()):
+                ema_param.data.mul_(self.ema_decay).add_(model_param.data, alpha=1 - self.ema_decay)
+    
+    def training_step(self, model, inputs):
+        """Override training step to include EMA update."""
+        loss = super().training_step(model, inputs)
+        
+        # Initialize EMA on first training step if needed
+        if self.use_ema and not self._ema_initialized:
+            self._init_ema()
+            self._ema_initialized = True
+        
+        # Update EMA after each training step
+        if self.use_ema and self._ema_initialized:
+            self._update_ema()
+        
+        return loss
+    
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        """Save both the main model and EMA model."""
+        super().save_model(output_dir, _internal_call)
+        
+        # Save EMA model if enabled
+        if self.use_ema and self.ema_model is not None and output_dir is not None:
+            ema_output_dir = os.path.join(output_dir, "ema_model")
+            os.makedirs(ema_output_dir, exist_ok=True)
+            self.ema_model.save_pretrained(ema_output_dir)
+
+
 def create_optimizer(self):
 
     opt_model = self.model
@@ -382,6 +435,15 @@ def create_optimizer(self):
         optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
             self.args
         )
+        
+        # Override AdamW beta parameters if specified
+        if hasattr(self.args, 'adam_beta1') and hasattr(self.args, 'adam_beta2'):
+            if 'betas' in optimizer_kwargs:
+                optimizer_kwargs['betas'] = (self.args.adam_beta1, self.args.adam_beta2)
+            elif optimizer_cls.__name__ == 'AdamW':
+                # For AdamW optimizer, set betas directly
+                optimizer_kwargs['betas'] = (self.args.adam_beta1, self.args.adam_beta2)
+        
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
     return self.optimizer
