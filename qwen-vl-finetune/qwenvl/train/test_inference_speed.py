@@ -32,7 +32,7 @@ class BenchmarkConfig:
     model_path: str = "Qwen/Qwen2.5-VL-7B-Instruct"  # Base model or fine-tuned checkpoint
     action_tokenizer_path: str = "physical-intelligence/fast"
     action_chunk_size: int = 15
-    action_vocab_size: int = 512
+
     state_vocab_size: int = 256
     num_warmup_runs: int = 5
     num_benchmark_runs: int = 20
@@ -102,10 +102,14 @@ class InferenceSpeedTester:
         # Load action tokenizer
         self._load_action_tokenizer()
         
+        # Get actual action vocab size from the tokenizer
+        action_vocab_size = self.action_tokenizer.vocab_size
+        print(f"Action tokenizer vocab size: {action_vocab_size}")
+        
         # Get token mappings
         self.token_mappings = get_action_state_token_mappings(
             self.tokenizer, 
-            config.action_vocab_size, 
+            action_vocab_size, 
             config.state_vocab_size
         )
         
@@ -127,24 +131,15 @@ class InferenceSpeedTester:
                 checkpoint_info = json.load(f)
             self.token_mappings = checkpoint_info.get("token_mappings")
             
-        # Load model (try VLA model first, then base model)
-        try:
-            self.model = VLAQwenModel.from_pretrained(
-                self.config.model_path,
-                torch_dtype=torch.bfloat16,
-                device_map="auto" if self.config.device == "cuda" else None,
-                attn_implementation="flash_attention_2" if self.config.use_flash_attention else None,
-            )
-            print("Loaded VLAQwenModel successfully")
-        except:
-            print("VLAQwenModel failed, loading base Qwen2_5_VLForConditionalGeneration")
-            from transformers import Qwen2_5_VLForConditionalGeneration
-            self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                self.config.model_path,
-                torch_dtype=torch.bfloat16,
-                device_map="auto" if self.config.device == "cuda" else None,
-                attn_implementation="flash_attention_2" if self.config.use_flash_attention else None,
-            )
+        # Load model (use base model directly)
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        self.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            self.config.model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto" if self.config.device == "cuda" else None,
+            attn_implementation="flash_attention_2" if self.config.use_flash_attention else None,
+        )
+        print("Loaded Qwen2_5_VLForConditionalGeneration successfully")
         
         self.model.eval()
         
@@ -311,7 +306,7 @@ class InferenceSpeedTester:
                 add_generation_prompt=False
             )
             
-            # Replace control token strings with mapped Chinese characters
+            # Replace control token strings with mapped infrequent characters
             if hasattr(self, 'token_mappings') and self.token_mappings:
                 for control_string, token_id in self.token_mappings['control_mappings'].items():
                     if control_string in text:

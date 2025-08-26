@@ -9,10 +9,13 @@ import pathlib
 import torch
 import transformers
 import json
-from typing import Dict
+from typing import Dict, List, Optional
 import shutil
 import sys
 from pathlib import Path
+import numpy as np
+from datetime import datetime
+import wandb
 
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
@@ -23,13 +26,17 @@ from trainer import replace_qwen2_vl_attention_class
 from transformers import (
     Qwen2VLForConditionalGeneration,
     Qwen2_5_VLForConditionalGeneration,
+    AutoProcessor,
+    TrainingArguments as HfTrainingArguments,
 )
 from qwenvl.data.data_droid import make_droid_data_module
+from qwenvl.data.data_mixed_vla import make_mixed_vla_data_module
 from qwenvl.train.argument import (
     ModelArguments,
     DataArguments,
     TrainingArguments,
 )
+from qwenvl.train.generation_callback import GenerationLoggingCallback
 from transformers import AutoTokenizer, AutoProcessor, Qwen2VLImageProcessor, Trainer
 # from qwenvl.train.trainer import EMATrainer  # TODO: Uncomment when implementing custom EMA
 from dataclasses import dataclass, field
@@ -45,7 +52,6 @@ def rank0_print(*args):
 @dataclass
 class VLAModelArguments(ModelArguments):
     """Extended model arguments for VLA training."""
-    action_vocab_size: int = field(default=512, metadata={"help": "Size of action vocabulary"})
     action_tokenizer_path: str = field(default="KarlP/fast-droid", metadata={"help": "Path to action tokenizer"})
 
 
@@ -60,32 +66,44 @@ class VLADataArguments(DataArguments):
     num_train_samples: int = field(default=1000000)
     image_height: int = field(default=180, metadata={"help": "Height to resize images to"})
     image_width: int = field(default=320, metadata={"help": "Width to resize images to"})
+    
+    # Co-training with regular JSON data to prevent catastrophic forgetting
+    enable_cotrain: bool = field(default=False, metadata={"help": "Enable co-training with regular JSON data"})
+    cotrain_json_paths: str = field(default="", metadata={"help": "Comma-separated paths to JSON/JSONL files for co-training"})
+    cotrain_json_ratio: float = field(default=0.2, metadata={"help": "Ratio of regular JSON data in mixed training (0.0-1.0)"})
 
 
-class VLAQwenModel(Qwen2_5_VLForConditionalGeneration):
-    """Extended Qwen model for VLA that can handle action tokens."""
-    
-    def __init__(self, config):
-        super().__init__(config)
-        
-    def forward(self, *args, **kwargs):
-        """Forward pass with special handling for action tokens."""
-        # During training, action tokens are treated as regular tokens
-        # The loss computation will only consider action tokens due to labels masking
-        kwargs.pop("num_items_in_batch", None)
-        return super().forward(*args, **kwargs)
-    
-    def generate(self, *args, **kwargs):
-        """Generate method that can produce action tokens."""
-        # # Ensure action tokens can be generated
-        # if "bad_words_ids" not in kwargs:
-        #     kwargs["bad_words_ids"] = []
-        
-        # # Allow generation of action tokens
-        # if "force_words_ids" not in kwargs:
-        #     kwargs["force_words_ids"] = []
-            
-        return super().generate(*args, **kwargs)
+@dataclass
+class VLATrainingArguments(TrainingArguments):
+    """Extended training arguments with evaluation settings for VLA."""
+    evaluation_strategy: str = field(
+        default="steps",
+        metadata={"help": "The evaluation strategy to adopt during training."}
+    )
+    eval_steps: int = field(
+        default=500,
+        metadata={"help": "Run an evaluation every X steps."}
+    )
+    save_strategy: str = field(
+        default="steps",
+        metadata={"help": "The checkpoint save strategy to adopt during training."}
+    )
+    logging_steps: int = field(
+        default=10,
+        metadata={"help": "Log every X updates steps."}
+    )
+    num_generation_examples: int = field(
+        default=10,
+        metadata={"help": "Number of examples to generate during evaluation for logging."}
+    )
+    log_generations_to_wandb: bool = field(
+        default=True,
+        metadata={"help": "Whether to log generation examples to wandb."}
+    )
+
+
+# Note: We use the base Qwen2_5_VLForConditionalGeneration directly
+# since we're only remapping existing infrequent tokens, not modifying the model architecture
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
@@ -129,37 +147,46 @@ def set_model(model_args, model):
         model.lm_head.requires_grad = False
 
 
-def get_action_state_token_mappings(tokenizer, action_vocab_size=512, state_vocab_size=256):
-    """Get token ID mappings for action and state tokens using existing Chinese tokens."""
+def get_action_state_token_mappings(tokenizer, action_vocab_size=1024, state_vocab_size=256, output_dir=None):
+    """Get token ID mappings using 3000+ rare Unicode symbols."""
     
-    # Reserve specific ranges in existing vocabulary for actions and states
-    # Use tokens starting from 102500 (Chinese characters that we won't need for English/robotics)
-    state_token_start = 102500
-    action_token_start = state_token_start + state_vocab_size  # 102756
-    control_token_start = action_token_start + action_vocab_size  # After action tokens
+    # Use rare Unicode symbols range (148000-151000 = 3000 tokens)
+    base_start = 148000
     
-    # Verify these tokens exist in the vocabulary
-    vocab_size = len(tokenizer)
-    max_needed_token = control_token_start + 4  # Need 4 control tokens
+    # Log base_start value to file in run directory
+    if output_dir:
+        import os
+        from datetime import datetime
+        log_file = os.path.join(output_dir, "token_mapping_log.txt")
+        with open(log_file, "a") as f:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            f.write(f"[{timestamp}] base_start value: {base_start}\n")
     
-    if max_needed_token > vocab_size:
-        raise ValueError(f"Not enough existing tokens. Need up to {max_needed_token}, but vocab size is {vocab_size}")
+    state_token_start = base_start                           # 148000
+    action_token_start = state_token_start + state_vocab_size # 148256  
+    control_token_start = action_token_start + action_vocab_size # 149280
     
-    # Create mappings for action and state tokens (use existing Chinese tokens)
+    # Verify we have enough tokens
+    total_needed = state_vocab_size + action_vocab_size + 4  # +4 for control tokens
+    max_token_id = control_token_start + 4                   # 149284
+    
+    if max_token_id > 151000:  # Our safe range limit
+        raise ValueError(f"Need {total_needed} tokens but safe range only has {151000-base_start}")
+    
+    # Create mappings
     state_token_ids = list(range(state_token_start, state_token_start + state_vocab_size))
     action_token_ids = list(range(action_token_start, action_token_start + action_vocab_size))
     
-    # Map control token strings to existing Chinese token IDs (NO new tokens added!)
     control_mappings = {
-        "<|action_start|>": control_token_start,      # Map string to existing token ID
-        "<|action_end|>": control_token_start + 1,    # Map string to existing token ID
-        "<|state_start|>": control_token_start + 2,   # Map string to existing token ID  
-        "<|state_end|>": control_token_start + 3,     # Map string to existing token ID
+        "<|action_start|>": control_token_start,
+        "<|action_end|>": control_token_start + 1, 
+        "<|state_start|>": control_token_start + 2,
+        "<|state_end|>": control_token_start + 3,
     }
     
     return {
         "state_token_ids": state_token_ids,
-        "action_token_ids": action_token_ids,
+        "action_token_ids": action_token_ids, 
         "control_mappings": control_mappings,
         "action_start_id": control_mappings["<|action_start|>"],
         "action_end_id": control_mappings["<|action_end|>"],
@@ -172,7 +199,7 @@ def train(attn_implementation="flash_attention_2"):
     global local_rank
 
     parser = transformers.HfArgumentParser(
-        (VLAModelArguments, VLADataArguments, TrainingArguments)
+        (VLAModelArguments, VLADataArguments, VLATrainingArguments)
     )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
@@ -181,8 +208,8 @@ def train(attn_implementation="flash_attention_2"):
 
     # Load model
     if "qwen2.5" in model_args.model_name_or_path.lower():
-        # Use custom VLA model class
-        model = VLAQwenModel.from_pretrained(
+        # Use base model directly since we're only using existing tokens
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
             attn_implementation=attn_implementation,
@@ -217,10 +244,19 @@ def train(attn_implementation="flash_attention_2"):
         use_fast=False,
     )
     
-    # Get action and state token mappings using existing Chinese tokens
-    token_mappings = get_action_state_token_mappings(tokenizer, model_args.action_vocab_size)
+    # Load action tokenizer to get its vocabulary size
+    rank0_print(f"Loading action tokenizer from {model_args.action_tokenizer_path}")
+    action_tokenizer = AutoProcessor.from_pretrained(
+        model_args.action_tokenizer_path, 
+        trust_remote_code=True
+    )
+    action_vocab_size = action_tokenizer.vocab_size
+    rank0_print(f"Action tokenizer vocab size: {action_vocab_size}")
     
-    rank0_print(f"Token mappings - all existing Chinese tokens:")
+    # Get action and state token mappings using actual tokenizer vocab size
+    token_mappings = get_action_state_token_mappings(tokenizer, action_vocab_size, output_dir=training_args.output_dir)
+    
+    rank0_print(f"Token mappings - all existing infrequent tokens:")
     rank0_print(f"  State: {token_mappings['state_token_ids'][0]}-{token_mappings['state_token_ids'][-1]}")
     rank0_print(f"  Action: {token_mappings['action_token_ids'][0]}-{token_mappings['action_token_ids'][-1]}")
     rank0_print(f"  Control: {token_mappings['control_mappings']}")
@@ -228,28 +264,68 @@ def train(attn_implementation="flash_attention_2"):
     # Set model trainable parameters
     set_model(model_args, model)
 
-    if torch.distributed.get_rank() == 0:
+    if local_rank == 0:
         rank0_print("Model architecture:")
         rank0_print(f"Vision encoder trainable: {model_args.tune_mm_vision}")
         rank0_print(f"Vision-language connector trainable: {model_args.tune_mm_mlp}")
         rank0_print(f"Language model trainable: {model_args.tune_mm_llm}")
-        rank0_print(f"Action vocabulary size: {model_args.action_vocab_size}")
+        rank0_print(f"Action vocabulary size: {action_vocab_size}")
     
-    # Create DROID data module with token mappings
-    data_module = make_droid_data_module(
-        tokenizer=tokenizer, 
-        data_args=data_args,
-        model_max_length=training_args.model_max_length,
+    # Create data module with token mappings
+    if data_args.enable_cotrain and data_args.cotrain_json_paths:
+        # Parse comma-separated JSON paths
+        json_paths = [path.strip() for path in data_args.cotrain_json_paths.split(",") if path.strip()]
+        data_args.cotrain_json_paths = json_paths
+        
+        rank0_print(f"Co-training enabled with {len(json_paths)} JSON datasets")
+        rank0_print(f"JSON ratio: {data_args.cotrain_json_ratio:.2f}")
+        rank0_print(f"JSON paths: {json_paths}")
+        
+        data_module = make_mixed_vla_data_module(
+            tokenizer=tokenizer,
+            action_tokenizer=action_tokenizer,
+            data_args=data_args,
+            model_max_length=training_args.model_max_length,
+            token_mappings=token_mappings,
+            image_size=(data_args.image_height, data_args.image_width),
+            cotrain_json_ratio=data_args.cotrain_json_ratio,
+        )
+    else:
+        # Standard VLA-only training
+        rank0_print("VLA-only training (no co-training)")
+        data_module = make_droid_data_module(
+            tokenizer=tokenizer, 
+            action_tokenizer=action_tokenizer,
+            data_args=data_args,
+            model_max_length=training_args.model_max_length,
+            token_mappings=token_mappings,
+            image_size=(data_args.image_height, data_args.image_width)
+        )
+    
+    # Create generation logging callback with the shared action tokenizer
+    # The action tokenizer will be initialized through normal data loading
+    generation_callback = GenerationLoggingCallback(
+        tokenizer=tokenizer,
+        action_tokenizer=action_tokenizer,
         token_mappings=token_mappings,
-        image_size=(data_args.image_height, data_args.image_width)
+        num_examples=training_args.num_generation_examples,
+        log_file="generations.txt",
+        log_to_wandb=training_args.log_generations_to_wandb,
     )
     
-    # Initialize trainer
+    # Initialize trainer with callback
     trainer = Trainer(
         model=model, 
         processing_class=tokenizer, 
         args=training_args, 
+        callbacks=[generation_callback],
         **data_module
+    )
+    
+    # Set up the callback with trainer components
+    generation_callback.setup_trainer_components(
+        model=model,
+        eval_dataloader=trainer.get_eval_dataloader() if data_module['eval_dataset'] is not None else None
     )
     
     # TODO: Switch to EMATrainer when implementing custom EMA support
@@ -270,7 +346,7 @@ def train(attn_implementation="flash_attention_2"):
     # Save action tokenizer info
     action_tokenizer_info = {
         "action_tokenizer_path": model_args.action_tokenizer_path,
-        "action_vocab_size": model_args.action_vocab_size,
+        "action_vocab_size": action_vocab_size,
         "state_token_range": [token_mappings['state_token_ids'][0], token_mappings['state_token_ids'][-1]],
         "action_token_range": [token_mappings['action_token_ids'][0], token_mappings['action_token_ids'][-1]],
         "control_mappings": token_mappings['control_mappings'],

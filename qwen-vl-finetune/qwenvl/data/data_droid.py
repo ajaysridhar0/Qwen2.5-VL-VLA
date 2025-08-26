@@ -60,7 +60,7 @@ class DroidVLADataset(Dataset):
         self, 
         tokenizer: transformers.PreTrainedTokenizer,
         data_args,
-        action_tokenizer_path: str = "physical-intelligence/fast",
+        action_tokenizer,
         model_max_length: int = 2048,
         token_mappings: Dict = None,
         image_size: tuple = (180, 320),
@@ -74,12 +74,9 @@ class DroidVLADataset(Dataset):
         self.token_mappings = token_mappings
         self.image_size = image_size  # Store the reshape size (height, width)
         
-        # Load the fast action tokenizer
-        rank0_print(f"Loading action tokenizer from {action_tokenizer_path}")
-        self.action_tokenizer = AutoProcessor.from_pretrained(
-            action_tokenizer_path, 
-            trust_remote_code=True
-        )
+        # Use the provided action tokenizer instance
+        self.action_tokenizer = action_tokenizer
+        rank0_print(f"Using shared action tokenizer instance")
         
         # Initialize DROID dataset
         self.droid_dataset = DroidRldsDataset(
@@ -142,13 +139,13 @@ class DroidVLADataset(Dataset):
         
         # digitize state (256 bins -> indices 0..255)
         discretized_state = np.digitize(normalized_state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
-        # Map discretized state to existing Chinese token IDs
+        # Map discretized state to existing infrequent token IDs
         mapped_state_tokens = [self.token_mappings['state_token_ids'][int(idx)] for idx in discretized_state.reshape(-1).tolist()]
         
         # Tokenize actions using the fast tokenizer
         action_tokens = self.action_tokenizer(normalized_actions.reshape(1, -1, normalized_actions.shape[-1]))[0]  # Get tokens for single example
 
-        # Map action tokens to existing Chinese token IDs
+        # Map action tokens to existing infrequent token IDs
         mapped_action_tokens = [self.token_mappings['action_token_ids'][int(token_idx)] for token_idx in action_tokens]
         
         # Process images with Qwen's image processor
@@ -188,11 +185,11 @@ class DroidVLADataset(Dataset):
             add_generation_prompt=False
         )
         
-        # Replace control token strings with mapped Chinese characters before tokenization
+        # Replace control token strings with mapped infrequent characters before tokenization
         text_modified = text
         for control_string, token_id in self.token_mappings['control_mappings'].items():
             if control_string in text_modified:
-                # Replace the string with the actual Chinese character that has this token ID
+                # Replace the string with the actual infrequent character that has this token ID
                 replacement_token = self.tokenizer.decode([token_id])
                 text_modified = text_modified.replace(control_string, replacement_token)
         
@@ -306,10 +303,12 @@ class DroidDataCollator:
 
 def make_droid_data_module(
     tokenizer: transformers.PreTrainedTokenizer, 
+    action_tokenizer,
     data_args,
     model_max_length: int,
     token_mappings: Dict = None,
     image_size: tuple = (180, 320),
+    create_eval_dataset: bool = True,
 ) -> Dict:
     """Make dataset and collator for DROID VLA fine-tuning."""
     
@@ -318,17 +317,32 @@ def make_droid_data_module(
         data_args.droid_data_dir = "/iliad2/u/ajaysri/episodic_memory/droid_rlds"
     
     train_dataset = DroidVLADataset(
-        tokenizer=tokenizer, 
+        tokenizer=tokenizer,
+        action_tokenizer=action_tokenizer,
         data_args=data_args,
         model_max_length=model_max_length,
         token_mappings=token_mappings,
         image_size=image_size,
     )
     
+    # Create a small eval dataset using the same dataset class
+    eval_dataset = None
+    if create_eval_dataset:
+        eval_dataset = DroidVLADataset(
+            tokenizer=tokenizer,
+            action_tokenizer=action_tokenizer,
+            data_args=data_args,
+            model_max_length=model_max_length,
+            token_mappings=token_mappings,
+            image_size=image_size,
+        )
+        # Override length for eval dataset to be smaller
+        eval_dataset.__len__ = lambda: 100  # Small eval set
+    
     data_collator = DroidDataCollator(tokenizer=tokenizer)
     
     return dict(
         train_dataset=train_dataset,
-        eval_dataset=None,
+        eval_dataset=eval_dataset,
         data_collator=data_collator
     )

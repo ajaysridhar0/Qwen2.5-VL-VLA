@@ -242,6 +242,10 @@ class LazySupervisedDataset(Dataset):
         return image_tensor, grid_thw
 
     def process_video(self, video_file):
+        # Check if video_file is a list of image frames
+        if isinstance(video_file, list) and all(".jpg" in f or ".png" in f for f in video_file):
+            return self.process_video_from_frames(video_file)
+        
         decord_video = None
         decord_attempts = 0
         max_decord_attempts = 3
@@ -308,7 +312,7 @@ class LazySupervisedDataset(Dataset):
         fps = len(frame_idx) / video_length
         processor = copy.deepcopy(self.data_args.image_processor)
         processor.max_pixels = self.data_args.video_max_frame_pixels
-        processor.min_pixels = self.data_args.video_min_frame_pixels
+        s.min_pixels = self.data_args.video_min_frame_pixels
         processor.size["longest_edge"] = processor.max_pixels
         processor.size["shortest_edge"] = processor.min_pixels
         video_processed = processor.preprocess(
@@ -320,6 +324,43 @@ class LazySupervisedDataset(Dataset):
             self.data_args.image_processor.temporal_patch_size / fps
         ] * len(grid_thw)
         return video_tensor, grid_thw, second_per_grid_ts
+
+    def process_video_from_frames(self, frame_paths):
+        """Process video from a list of frame image paths."""
+        # Load frames
+        frames = []
+        for frame_path in frame_paths:
+            try:
+                img = Image.open(frame_path).convert("RGB")
+                frames.append(np.array(img))
+            except Exception as e:
+                print(f"Failed to load frame {frame_path}: {e}")
+                continue
+        
+        if not frames:
+            raise ValueError("No frames could be loaded")
+        
+        # Convert to numpy array with shape (num_frames, height, width, channels)
+        video = np.stack(frames)
+        
+        # Determine frame sampling
+        total_frames = len(frames)
+        video_min_frames = getattr(self.data_args, "video_min_frames", 4)
+        video_max_frames = getattr(self.data_args, "video_max_frames", 8)
+        
+        # Sample frames if needed
+        if total_frames > video_max_frames:
+            frame_idx = np.linspace(0, total_frames - 1, video_max_frames, dtype=int)
+            frame_idx = np.unique(frame_idx)
+            video = video[frame_idx]
+        else:
+            frame_idx = np.arange(total_frames)
+        
+        # Assume 1 fps for frame sequences (can be adjusted)
+        # NOTE (ajaysri): I assume this is fine.
+        video_length = len(frame_idx)
+        
+        return self.process_video_frames(video, frame_idx, video_length)
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         num_base_retries = 3
