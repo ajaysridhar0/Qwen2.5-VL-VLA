@@ -428,19 +428,22 @@ class MixedVLADataset(Dataset):
                 raise RuntimeError("No JSON dataset loaded but vla_ratio is 0 - this should not happen")
         
         # Normal mixed case - decide whether to return VLA or JSON data based on ratio
-        if self.json_dataset and random.random() < self.cotrain_json_ratio:
-            # Return JSON conversational data
-            # try:
-            return self._get_json_item(idx)
-            # except Exception as e:
-            #     rank0_print(f"Error loading JSON item {idx}: {e}")
-            #     # Fallback to VLA data
-            #     vla_idx = idx % self.vla_size
-            #     return self.vla_dataset[vla_idx]
-        else:
-            # Return VLA data
-            vla_idx = idx % self.vla_size
-            return self.vla_dataset[vla_idx]
+        # Use deterministic sampling based on index to ensure reproducibility
+        if self.json_dataset:
+            # Use a simple hash-based deterministic approach
+            # This ensures the same idx always returns the same data type
+            import hashlib
+            hash_input = f"{idx}_{self.cotrain_json_ratio}".encode()
+            hash_value = int(hashlib.md5(hash_input).hexdigest()[:8], 16)
+            random_value = (hash_value % 1000000) / 1000000.0  # Convert to 0-1 range
+            
+            if random_value < self.cotrain_json_ratio:
+                # Return JSON conversational data
+                return self._get_json_item(idx)
+        
+        # Return VLA data (either no JSON dataset or deterministic choice selected VLA)
+        vla_idx = idx % self.vla_size
+        return self.vla_dataset[vla_idx]
 
 
 @dataclass
@@ -558,9 +561,11 @@ def make_mixed_vla_data_module(
         cotrain_json_ratio=cotrain_json_ratio,
     )
     
-    # Create a small eval dataset using the same dataset class
+    # Create a small eval dataset with 100 samples
     eval_dataset = None
     if create_eval_dataset:
+        eval_size = 100  # Fixed 100 samples for eval
+        
         eval_dataset = MixedVLADataset(
             tokenizer=tokenizer,
             action_tokenizer=action_tokenizer,
@@ -570,34 +575,19 @@ def make_mixed_vla_data_module(
             image_size=image_size,
             cotrain_json_ratio=cotrain_json_ratio,
         )
-        # Simple: 100 examples, but respect the training ratio
-        if train_dataset.json_dataset:
-            if train_dataset.vla_ratio == 0.0:
-                # 100% JSON case: only JSON examples in eval
-                eval_vla_size = 0
-                eval_json_size = 100
-                eval_total_size = 100
-            else:
-                # Mixed case: 100 of each
-                eval_vla_size = 100
-                eval_json_size = 100
-                eval_total_size = 200
-        else:
-            # VLA-only case
-            eval_vla_size = 100
-            eval_total_size = 100
         
-        # Override length for eval dataset
-        eval_dataset.__len__ = lambda: eval_total_size
+        # Override length and total_size for eval dataset
+        eval_dataset.total_size = eval_size
+        eval_dataset.__len__ = lambda: eval_size
         
         # Print eval dataset configuration
         if train_dataset.json_dataset:
             if train_dataset.vla_ratio == 0.0:
-                print(f"Eval dataset configured: JSON-only={eval_total_size}")
+                print(f"Eval dataset configured: JSON-only={eval_size}")
             else:
-                print(f"Eval dataset configured: VLA={eval_vla_size}, JSON={eval_json_size}, Total={eval_total_size}")
+                print(f"Eval dataset configured: Mixed={eval_size} (VLA ratio={train_dataset.vla_ratio:.2f}, JSON ratio={train_dataset.cotrain_json_ratio:.2f})")
         else:
-            print(f"Eval dataset configured: VLA-only={eval_total_size}")
+            print(f"Eval dataset configured: VLA-only={eval_size}")
     
     data_collator = MixedVLADataCollator(
         tokenizer=tokenizer,

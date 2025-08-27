@@ -339,6 +339,7 @@ def make_droid_data_module(
         # Simple: always 100 examples for eval
         eval_size = 100
         eval_dataset.__len__ = lambda: eval_size
+        eval_dataset.total_size = eval_size
         print(f"Eval dataset configured: VLA-only={eval_size}")
     
     data_collator = DroidDataCollator(tokenizer=tokenizer)

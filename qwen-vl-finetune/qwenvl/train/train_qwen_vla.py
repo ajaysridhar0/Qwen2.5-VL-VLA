@@ -325,6 +325,7 @@ def train(attn_implementation="flash_attention_2"):
     )
     
     # Set up the callback with trainer components
+    breakpoint()
     generation_callback.setup_trainer_components(
         model=model,
         eval_dataloader=trainer.get_eval_dataloader() if data_module['eval_dataset'] is not None else None
