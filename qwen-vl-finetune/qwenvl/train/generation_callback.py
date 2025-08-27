@@ -109,7 +109,6 @@ class GenerationLoggingCallback(TrainerCallback):
                 
                 # Check if this is a VLA example (has action tokens) or JSON example
                 input_ids = batch['input_ids'][0]
-                batch_size = batch['input_ids'].shape[0]
                 is_vla_example = self.action_start_id in input_ids.tolist()
                 
                 if is_vla_example:
@@ -140,10 +139,11 @@ class GenerationLoggingCallback(TrainerCallback):
                             rank0_print(f"[GenerationLogger] Skipping VLA example - no image data in batch")
                             continue
 
-
-                        total_num_patches = batch['pixel_values'].shape[0]
-                        pixel_values = batch['pixel_values'][:(total_num_patches // batch_size)]
-                        image_grid_thw = batch['image_grid_thw'][:2] # two images per batch
+                        input_text =  self.tokenizer.decode(batch['input_ids'][0])
+                        num_images = input_text.count("<|vision_start|>")
+                        total_num_patches = input_text.count("<|image_pad|>") * 4 # 4 patches per token
+                        pixel_values = batch['pixel_values'][:total_num_patches]
+                        image_grid_thw = batch['image_grid_thw'][:num_images] # two images per batch
                         
                         # Debug shapes
                         rank0_print(f"[GenerationLogger] pixel_values shape: {pixel_values.shape if pixel_values is not None else 'None'}")
@@ -266,12 +266,18 @@ class GenerationLoggingCallback(TrainerCallback):
                             if token_id != -100:
                                 gt_token_ids.append(token_id)
                         gt_text = self.tokenizer.decode(gt_token_ids, skip_special_tokens=True)
+
+                        input_text =  self.tokenizer.decode(batch['input_ids'][0])
+                        num_images = input_text.count("<|vision_start|>")
+                        total_num_patches = input_text.count("<|image_pad|>") * 4 # 4 patches per token
+                        pixel_values = batch['pixel_values'][:total_num_patches]
+                        image_grid_thw = batch['image_grid_thw'][:num_images] # two images per batch
                         
                         # Generate text response
                         outputs = model.generate(
                             input_ids=gen_input_ids,
-                            pixel_values=batch.get('pixel_values', None)[:1] if 'pixel_values' in batch and batch['pixel_values'] is not None else None,
-                            image_grid_thw=batch.get('image_grid_thw', None)[:1] if 'image_grid_thw' in batch and batch['image_grid_thw'] is not None else None,
+                            pixel_values=pixel_values,
+                            image_grid_thw=image_grid_thw,
                             max_new_tokens=min(len(gt_token_ids) + 50, 200),  # Allow some extra tokens but cap at 200
                             do_sample=False,  # Use greedy decoding for deterministic results
                             pad_token_id=self.tokenizer.pad_token_id,
