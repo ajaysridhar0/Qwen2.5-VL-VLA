@@ -42,8 +42,8 @@ def preprocess_qwen_2_visual(
     grid_thw_video: List = [],
 ) -> Dict:
     """Simplified preprocessing for mixed VLA training."""
-    roles = {"human": "user", "gpt": "assistant"}
-    system_message = "You are a helpful assistant."
+    roles = {"human": "user", "gpt": "assistant", "system": "system"}
+    default_system_message = "You are a helpful assistant."
 
     tokenizer = copy.deepcopy(tokenizer)
     chat_template = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
@@ -53,8 +53,27 @@ def preprocess_qwen_2_visual(
     input_ids, targets = [], []
 
     for i, source in enumerate(sources):
+        # Extract system message from the conversation if present
+        system_message = default_system_message
+        filtered_source = []
+        
+        for msg in source:
+            try:
+                role = msg.get("role", msg.get("from", ""))
+                content = msg.get("content", msg.get("value", ""))
+            except:
+                role = msg.get("from", "")
+                content = msg.get("value", "")
+            
+            if role == "system":
+                system_message = content
+            else:
+                filtered_source.append(msg)
+        
+        source = filtered_source
+        
         try:
-            if roles[source[0]["from"]] != roles["human"]:
+            if source and roles.get(source[0].get("from", source[0].get("role", "")), "") != roles["human"]:
                 source = source[1:]
         except:
             print(sources)

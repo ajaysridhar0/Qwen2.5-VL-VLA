@@ -169,11 +169,16 @@ class DroidVLADataset(Dataset):
                 "<|vision_start|>" + ("<|image_pad|>" * count) + "<|vision_end|>"
             )
 
-        user_content = "\n".join(vision_segments) + "\n" + "State:<|state_start|><|state_end|>" + "\n" + (
-            f"Task: {prompt}\nWhat action should the robot perform?"
+        # Format: text first, then images - matches web training co-training (pixel-reasoner) data format for consistency
+        user_content = (
+            f"Task: {prompt}\n"
+            f"State:<|state_start|><|state_end|>\n"
+            f"What action should the robot perform?\n"
+            + "\n".join(vision_segments)
         )
 
         conversation = [
+            {"role": "system", "content": "You are a robot policy model that predicts actions given visual observations and tasks."},
             {"role": "user", "content": user_content},
             {"role": "assistant", "content": "<|action_start|>"},
         ]

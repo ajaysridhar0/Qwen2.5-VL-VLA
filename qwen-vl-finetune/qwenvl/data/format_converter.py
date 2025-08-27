@@ -10,7 +10,7 @@ from pathlib import Path
 
 def convert_qwen_api_to_training_format(api_messages: List[Dict[str, Any]], 
                                        base_data_path: str = "",
-                                       include_system_messages: bool = False) -> Dict[str, Any]:
+                                       include_system_messages: bool = True) -> Dict[str, Any]:
     """
     Convert Qwen API format messages to training data format.
     
