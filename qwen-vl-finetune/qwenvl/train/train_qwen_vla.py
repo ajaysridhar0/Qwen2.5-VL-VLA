@@ -63,7 +63,7 @@ class VLADataArguments(DataArguments):
     action_chunk_size: int = field(default=15)
     use_joint_velocity: bool = field(default=True)
     shuffle_buffer_size: int = field(default=100000)
-    num_train_samples: int = field(default=1000000)
+    num_droid_samples: int = field(default=20000000)
     image_height: int = field(default=180, metadata={"help": "Height to resize images to"})
     image_width: int = field(default=320, metadata={"help": "Width to resize images to"})
     
@@ -71,6 +71,8 @@ class VLADataArguments(DataArguments):
     enable_cotrain: bool = field(default=False, metadata={"help": "Enable co-training with regular JSON data"})
     cotrain_json_paths: str = field(default="", metadata={"help": "Comma-separated paths to JSON/JSONL files for co-training"})
     cotrain_json_ratio: float = field(default=0.2, metadata={"help": "Ratio of regular JSON data in mixed training (0.0-1.0)"})
+    
+
 
 
 @dataclass

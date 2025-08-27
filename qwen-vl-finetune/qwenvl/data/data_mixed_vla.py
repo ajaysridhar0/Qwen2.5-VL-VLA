@@ -570,8 +570,34 @@ def make_mixed_vla_data_module(
             image_size=image_size,
             cotrain_json_ratio=cotrain_json_ratio,
         )
-        # Override length for eval dataset to be smaller
-        eval_dataset.__len__ = lambda: 100  # Small eval set
+        # Simple: 100 examples, but respect the training ratio
+        if train_dataset.json_dataset:
+            if train_dataset.vla_ratio == 0.0:
+                # 100% JSON case: only JSON examples in eval
+                eval_vla_size = 0
+                eval_json_size = 100
+                eval_total_size = 100
+            else:
+                # Mixed case: 100 of each
+                eval_vla_size = 100
+                eval_json_size = 100
+                eval_total_size = 200
+        else:
+            # VLA-only case
+            eval_vla_size = 100
+            eval_total_size = 100
+        
+        # Override length for eval dataset
+        eval_dataset.__len__ = lambda: eval_total_size
+        
+        # Print eval dataset configuration
+        if train_dataset.json_dataset:
+            if train_dataset.vla_ratio == 0.0:
+                print(f"Eval dataset configured: JSON-only={eval_total_size}")
+            else:
+                print(f"Eval dataset configured: VLA={eval_vla_size}, JSON={eval_json_size}, Total={eval_total_size}")
+        else:
+            print(f"Eval dataset configured: VLA-only={eval_total_size}")
     
     data_collator = MixedVLADataCollator(
         tokenizer=tokenizer,

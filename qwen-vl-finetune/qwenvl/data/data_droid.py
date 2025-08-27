@@ -99,7 +99,7 @@ class DroidVLADataset(Dataset):
         
     def __len__(self):
         # Approximate length for DROID dataset
-        return getattr(self.data_args, 'num_train_samples', 1000000)
+        return getattr(self.data_args, 'num_droid_samples', 20_000_000)
     
     def _process_image(self, image_array):
         """Process numpy image array to PIL Image and resize to specified dimensions."""
@@ -336,8 +336,10 @@ def make_droid_data_module(
             token_mappings=token_mappings,
             image_size=image_size,
         )
-        # Override length for eval dataset to be smaller
-        eval_dataset.__len__ = lambda: 100  # Small eval set
+        # Simple: always 100 examples for eval
+        eval_size = 100
+        eval_dataset.__len__ = lambda: eval_size
+        print(f"Eval dataset configured: VLA-only={eval_size}")
     
     data_collator = DroidDataCollator(tokenizer=tokenizer)
     
