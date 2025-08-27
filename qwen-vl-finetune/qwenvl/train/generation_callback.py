@@ -86,6 +86,7 @@ class GenerationLoggingCallback(TrainerCallback):
             vla_generation_logs = []
             json_generation_logs = []
             vla_accuracies = []
+            json_accuracies = []
             
             # Sample examples from eval dataloader
             vla_examples_processed = 0
@@ -288,6 +289,10 @@ class GenerationLoggingCallback(TrainerCallback):
                         generated_tokens = outputs[0][len(gen_input_ids[0]):].tolist()
                         pred_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
                         
+                        # Calculate 0-1 accuracy (exact string match)
+                        is_correct = pred_text.strip() == gt_text.strip()
+                        json_accuracies.append(float(is_correct))
+                        
                         # Get input text
                         input_text = self.tokenizer.decode(input_ids[:assistant_start_pos].tolist(), skip_special_tokens=False)
                         
@@ -298,6 +303,7 @@ class GenerationLoggingCallback(TrainerCallback):
                             'input_text': input_text[-500:],  # Last 500 chars to avoid too long
                             'gt_text': gt_text[:200],  # Limit for display
                             'pred_text': pred_text[:200],
+                            'is_correct': is_correct,
                             'type': 'json',
                         }
                         json_generation_logs.append(log_entry)
@@ -310,11 +316,15 @@ class GenerationLoggingCallback(TrainerCallback):
             l2_distances = [log['l2_distance'] for log in vla_generation_logs if log['l2_distance'] is not None]
             avg_l2_distance = np.mean(l2_distances) if l2_distances else None
             
+            # Calculate overall JSON accuracy
+            json_accuracy = np.mean(json_accuracies) if json_accuracies else 0.0
+            
             # Log to wandb
             if self.log_to_wandb and wandb.run is not None:
                 log_dict = {
                     'eval/vla_generation_accuracy': vla_accuracy,
                     'eval/vla_num_examples': len(vla_accuracies),
+                    'eval/json_generation_accuracy': json_accuracy,
                     'eval/json_num_examples': len(json_generation_logs),
                     'global_step': state.global_step,
                 }
@@ -342,7 +352,7 @@ class GenerationLoggingCallback(TrainerCallback):
                 # Log JSON example generations to wandb
                 if json_generation_logs:
                     json_table = wandb.Table(
-                        columns=['step', 'example_idx', 'input_preview', 'gt_text', 'pred_text']
+                        columns=['step', 'example_idx', 'input_preview', 'gt_text', 'pred_text', 'correct']
                     )
                     for log in json_generation_logs[:5]:  # Log first 5 examples
                         json_table.add_data(
@@ -350,7 +360,8 @@ class GenerationLoggingCallback(TrainerCallback):
                             log['example_idx'],
                             log['input_text'][-200:],  # Last 200 chars
                             log['gt_text'][:100],  # First 100 chars
-                            log['pred_text'][:100]  # First 100 chars
+                            log['pred_text'][:100],  # First 100 chars
+                            log['is_correct']
                         )
                     wandb.log({'eval/json_generations': json_table})
             
@@ -364,6 +375,8 @@ class GenerationLoggingCallback(TrainerCallback):
                     f.write(f"VLA Accuracy: {vla_accuracy:.4f} ({len(vla_accuracies)} examples)\n")
                     if avg_l2_distance is not None:
                         f.write(f"Average L2 Distance: {avg_l2_distance:.4f} ({len(l2_distances)} examples)\n")
+                if json_generation_logs:
+                    f.write(f"JSON Accuracy: {json_accuracy:.4f} ({len(json_accuracies)} examples)\n")
                 f.write(f"{'='*80}\n\n")
                 
                 # Write VLA examples
@@ -390,9 +403,10 @@ class GenerationLoggingCallback(TrainerCallback):
                         f.write(f"Input (last 500 chars): ...{log['input_text']}\n")
                         f.write(f"GT Text: {log['gt_text']}\n")
                         f.write(f"Pred Text: {log['pred_text']}\n")
+                        f.write(f"Correct: {log['is_correct']}\n")
                         f.write(f"{'-'*40}\n\n")
             
-            rank0_print(f"[GenerationLogger] VLA: {len(vla_generation_logs)} examples, Accuracy: {vla_accuracy:.4f} | JSON: {len(json_generation_logs)} examples | Logged to {output_path}")
+            rank0_print(f"[GenerationLogger] VLA: {len(vla_generation_logs)} examples, Accuracy: {vla_accuracy:.4f} | JSON: {len(json_generation_logs)} examples, Accuracy: {json_accuracy:.4f} | Logged to {output_path}")
             
         except Exception as e:
             rank0_print(f"[GenerationLogger] Error during evaluation logging: {e}")
