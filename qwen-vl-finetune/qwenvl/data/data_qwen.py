@@ -513,6 +513,7 @@ class LazySupervisedDataset(Dataset):
             grid_thw_merged = None
             sources = copy.deepcopy([e["conversations"] for e in sources])
             data_dict = preprocess_qwen_2_visual(
+                # TODO: check if this is correct
                 sources, self.tokenizer, grid_thw_image=grid_thw_merged, max_length=getattr(self.tokenizer, 'model_max_length', None)
             )
             position_ids = (

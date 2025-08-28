@@ -37,7 +37,7 @@ from qwenvl.train.argument import (
     TrainingArguments,
 )
 from qwenvl.train.generation_callback import GenerationLoggingCallback
-from transformers import AutoTokenizer, AutoProcessor, Qwen2VLImageProcessor, Trainer
+from transformers import AutoTokenizer, AutoProcessor, Qwen2VLImageProcessor, Trainer, TrainerCallback
 # from qwenvl.train.trainer import EMATrainer  # TODO: Uncomment when implementing custom EMA
 from dataclasses import dataclass, field
 from torch.utils.data import DataLoader
@@ -48,6 +48,34 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
+
+
+class CheckpointProcessorCallback(TrainerCallback):
+    """Callback to save image processor config with each checkpoint."""
+    
+    def __init__(self, model_name_or_path: str):
+        self.model_name_or_path = model_name_or_path
+        self._processor = None
+    
+    def get_processor(self):
+        """Lazy load processor to avoid loading during import."""
+        if self._processor is None:
+            self._processor = AutoProcessor.from_pretrained(self.model_name_or_path)
+        return self._processor
+    
+    def on_save(self, args, state, control, **kwargs):
+        """Save image processor config when checkpoint is saved."""
+        if state.is_world_process_zero:  # Only save on main process
+            checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+            if os.path.exists(checkpoint_dir):
+                try:
+                    processor = self.get_processor()
+                    processor.image_processor.save_pretrained(checkpoint_dir)
+                    rank0_print(f"Saved preprocessor_config.json to {checkpoint_dir}")
+                except Exception as e:
+                    rank0_print(f"Warning: Failed to save preprocessor config to {checkpoint_dir}: {e}")
+        
+        return control
 
 
 class VLATrainer(Trainer):
@@ -107,7 +135,7 @@ class VLADataArguments(DataArguments):
     
     # Image resize constraints for JSON data
     max_image_dim: int = field(default=320, metadata={"help": "Maximum dimension (width or height) for resizing images"})
-    min_image_dim: int = field(default=28, metadata={"help": "Minimum dimension (width or height) after resizing images"})
+    min_image_dim: int = field(default=28, metadata={"help": "BOTH width AND height must be STRICTLY GREATER than this value (required by Qwen2VL processor)"})
     
     # Co-training with regular JSON data to prevent catastrophic forgetting
     enable_cotrain: bool = field(default=False, metadata={"help": "Enable co-training with regular JSON data"})
@@ -363,6 +391,10 @@ def train(attn_implementation="flash_attention_2"):
     
     # Create generation logging callback with the shared action tokenizer
     # The action tokenizer will be initialized through normal data loading
+    # call on dummy data to warmup the tokenizer
+    action_data = np.random.rand(10, data_args.action_chunk_size, 8)    # one batch of action chunks
+    _ = action_tokenizer(action_data)
+    
     generation_callback = GenerationLoggingCallback(
         tokenizer=tokenizer,
         action_tokenizer=action_tokenizer,
@@ -372,15 +404,18 @@ def train(attn_implementation="flash_attention_2"):
         log_to_wandb=training_args.log_generations_to_wandb,
     )
     
+    # Create checkpoint processor callback to save preprocessor config with each checkpoint
+    checkpoint_processor_callback = CheckpointProcessorCallback(model_args.model_name_or_path)
+    
     # Extract sampler params if present
     train_sampler_params = data_module.pop('train_sampler_params', None)
     
-    # Initialize trainer with callback
+    # Initialize trainer with callbacks
     trainer = VLATrainer(
         model=model, 
         processing_class=tokenizer, 
         args=training_args, 
-        callbacks=[generation_callback],
+        callbacks=[generation_callback, checkpoint_processor_callback],
         train_sampler_params=train_sampler_params,  # Pass sampler params to custom trainer
         **data_module
     )

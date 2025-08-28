@@ -163,19 +163,7 @@ class GenerationLoggingCallback(TrainerCallback):
                         # Additional debug info
                         rank0_print(f"[GenerationLogger] pixel_values numel: {pixel_values.numel()}")
                         rank0_print(f"[GenerationLogger] gen_input_ids shape: {gen_input_ids.shape}")
-                        
-                        # Skip generation for now - there's a shape mismatch issue
-                        # The pixel_values from the dataset are already processed vision features (2D)
-                        # but the model.generate expects raw images or differently shaped tensors
-                        rank0_print(f"[GenerationLogger] Skipping generation due to known shape mismatch issue")
-                        rank0_print(f"[GenerationLogger] This is a known issue with processed vision features during generation")
-                        
-                        # For now, just use ground truth as predictions to continue testing
-                        # pred_action_tokens = gt_action_tokens[:10]  # Use first 10 GT tokens as fake prediction
-                        
-                        # Continue with the rest of the logging
-                        # TODO: Fix generation with proper pixel_values format
-                        
+                  
                         # Generate action tokens
                         outputs = model.generate(
                             input_ids=gen_input_ids,
@@ -186,7 +174,6 @@ class GenerationLoggingCallback(TrainerCallback):
                             pad_token_id=self.tokenizer.pad_token_id,
                             eos_token_id=self.tokenizer.eos_token_id,
                         )
-                       
                         
                         # Extract generated action tokens
                         # (Commented out due to generation being skipped)

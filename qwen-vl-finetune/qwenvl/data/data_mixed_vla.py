@@ -48,13 +48,13 @@ def resize_image_with_constraints(image, max_dim=320, min_dim=28):
     """
     Resize an image such that:
     - The maximum dimension (width or height) does not exceed max_dim
-    - The minimum dimension (width or height) is at least min_dim
-    - Aspect ratio is preserved
+    - BOTH dimensions (width AND height) are STRICTLY GREATER than min_dim (required by Qwen2VL)
+    - Aspect ratio is preserved when possible, but can be modified if needed to meet constraints
     
     Args:
         image: PIL Image to resize
         max_dim: Maximum allowed dimension 
-        min_dim: Minimum required dimension
+        min_dim: Minimum required dimension for BOTH width and height (must be strictly greater than this)
         
     Returns:
         PIL Image: Resized image
@@ -67,24 +67,36 @@ def resize_image_with_constraints(image, max_dim=320, min_dim=28):
     # Calculate the scaling factor based on max dimension constraint
     max_scale = min(max_dim / width, max_dim / height)
     
-    # Calculate new dimensions with max constraint
+    # Calculate new dimensions with max constraint (preserving aspect ratio)
     new_width = int(width * max_scale)
     new_height = int(height * max_scale)
     
-    # Check if min dimension constraint is satisfied
-    min_current_dim = min(new_width, new_height)
-    if min_current_dim < min_dim:
-        # Scale up to meet min dimension requirement
-        min_scale = min_dim / min_current_dim
-        new_width = int(new_width * min_scale)
-        new_height = int(new_height * min_scale)
+    # Check if both dimensions meet minimum requirement (STRICTLY GREATER than min_dim)
+    if new_width <= min_dim or new_height <= min_dim:
+        # Check if we can fix this by scaling up while preserving aspect ratio
+        min_scale_width = (min_dim + 1) / new_width if new_width <= min_dim else 1.0
+        min_scale_height = (min_dim + 1) / new_height if new_height <= min_dim else 1.0
+        min_scale = max(min_scale_width, min_scale_height)
         
-        # Ensure we didn't violate max constraint after min scaling
-        # If we did, prioritize max constraint (this is edge case handling)
-        if max(new_width, new_height) > max_dim:
-            # Revert to max constraint scaling
-            new_width = int(width * max_scale)
-            new_height = int(height * max_scale)
+        scaled_width = int(new_width * min_scale)
+        scaled_height = int(new_height * min_scale)
+        
+        # If scaling up to meet min constraint violates max constraint, 
+        # we have a conflict and need to modify aspect ratio
+        if max(scaled_width, scaled_height) > max_dim:
+            # Clamp dimensions to meet both constraints, potentially changing aspect ratio
+            new_width = min(max(new_width, min_dim + 1), max_dim)
+            new_height = min(max(new_height, min_dim + 1), max_dim)
+            
+            # Ensure both dimensions are STRICTLY GREATER than min_dim (critical for Qwen2VL)
+            if new_width <= min_dim:
+                new_width = min_dim + 1
+            if new_height <= min_dim:
+                new_height = min_dim + 1
+        else:
+            # No conflict, use the scaled dimensions that preserve aspect ratio
+            new_width = scaled_width
+            new_height = scaled_height
     
     # Only resize if dimensions actually changed
     if new_width != width or new_height != height:

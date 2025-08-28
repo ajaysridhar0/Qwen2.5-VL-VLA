@@ -10,6 +10,7 @@ from torch.utils.data import Sampler
 from typing import Iterator, Optional
 import math
 import random
+import hashlib
 
 
 class FixedRatioSampler(Sampler):
@@ -77,21 +78,22 @@ class FixedRatioSampler(Sampler):
         
     def _prepare_indices(self):
         """Prepare indices for JSON and VLA samples."""
-        # For deterministic assignment, we'll use modulo to assign indices
-        # This ensures the same indices always map to the same data type
-        all_indices = list(range(self.dataset_size))
+        # Pre-allocate lists with estimated sizes for better performance
+        estimated_json_size = int(self.dataset_size * self.json_ratio * 1.1)  # 10% buffer
+        estimated_vla_size = self.dataset_size - estimated_json_size + int(self.dataset_size * 0.1)
         
-        # Deterministically assign indices to JSON or VLA
-        # Using a simple modulo approach to ensure reproducibility
         json_indices = []
         vla_indices = []
         
-        # Use a deterministic hash to decide which indices are JSON vs VLA
-        import hashlib
-        for idx in all_indices:
-            hash_input = f"{idx}_{self.json_ratio}".encode()
-            hash_value = int(hashlib.md5(hash_input).hexdigest()[:8], 16)
-            random_value = (hash_value % 1000000) / 1000000.0
+        # Pre-compute hash seed for this sampler configuration
+        ratio_bytes = str(self.json_ratio).encode()
+        ratio_hash = int(hashlib.md5(ratio_bytes).hexdigest()[:8], 16)
+        
+        # Use a more efficient deterministic assignment
+        for idx in range(self.dataset_size):
+            # Combine index and ratio hash for deterministic but well-distributed assignment
+            combined_hash = (idx * 2654435761 + ratio_hash) & 0xFFFFFFFF  # Fast hash mixing
+            random_value = (combined_hash % 1000000) / 1000000.0
             
             if random_value < self.json_ratio:
                 json_indices.append(idx)
@@ -108,51 +110,50 @@ class FixedRatioSampler(Sampler):
             g = torch.Generator()
             g.manual_seed(self.seed)
             
-            # Shuffle both index lists
-            json_indices = torch.randperm(len(self.json_indices), generator=g).tolist()
-            json_indices = [self.json_indices[i] for i in json_indices]
+            # More efficient shuffling using tensor operations directly
+            json_tensor = torch.tensor(self.json_indices, dtype=torch.long)
+            vla_tensor = torch.tensor(self.vla_indices, dtype=torch.long)
             
-            vla_indices = torch.randperm(len(self.vla_indices), generator=g).tolist()
-            vla_indices = [self.vla_indices[i] for i in vla_indices]
+            json_perm = torch.randperm(len(json_tensor), generator=g)
+            vla_perm = torch.randperm(len(vla_tensor), generator=g)
+            
+            json_indices = json_tensor[json_perm].tolist()
+            vla_indices = vla_tensor[vla_perm].tolist()
         else:
-            json_indices = self.json_indices.copy()
-            vla_indices = self.vla_indices.copy()
+            json_indices = self.json_indices
+            vla_indices = self.vla_indices
         
         # Create batches with fixed ratios
-        batch_indices = []
-        json_idx = 0
-        vla_idx = 0
+        # Pre-allocate with exact size to avoid repeated memory allocations
+        total_samples = self.total_batches * self.batch_size
+        batch_indices = [0] * total_samples
         
-        for _ in range(self.total_batches):
-            batch = []
+        # Pre-compute lengths to avoid repeated len() calls
+        json_len = len(json_indices)
+        vla_len = len(vla_indices)
+        
+        batch_idx = 0
+        for batch_num in range(self.total_batches):
+            batch_start = batch_idx
             
-            # Add JSON samples
-            for _ in range(self.json_per_batch):
-                if json_idx < len(json_indices):
-                    batch.append(json_indices[json_idx])
-                    json_idx += 1
-                else:
-                    # Wrap around if we run out
-                    json_idx = 0
-                    batch.append(json_indices[json_idx])
-                    json_idx += 1
+            # Add JSON samples using modulo arithmetic for wrapping
+            for i in range(self.json_per_batch):
+                json_idx = (batch_num * self.json_per_batch + i) % json_len
+                batch_indices[batch_idx] = json_indices[json_idx]
+                batch_idx += 1
             
-            # Add VLA samples
-            for _ in range(self.vla_per_batch):
-                if vla_idx < len(vla_indices):
-                    batch.append(vla_indices[vla_idx])
-                    vla_idx += 1
-                else:
-                    # Wrap around if we run out
-                    vla_idx = 0
-                    batch.append(vla_indices[vla_idx])
-                    vla_idx += 1
+            # Add VLA samples using modulo arithmetic for wrapping
+            for i in range(self.vla_per_batch):
+                vla_idx = (batch_num * self.vla_per_batch + i) % vla_len
+                batch_indices[batch_idx] = vla_indices[vla_idx]
+                batch_idx += 1
             
             # Shuffle within batch to mix JSON and VLA samples
             if self.shuffle:
-                random.Random(self.seed + len(batch_indices)).shuffle(batch)
-            
-            batch_indices.extend(batch)
+                batch_end = batch_idx
+                batch_slice = batch_indices[batch_start:batch_end]
+                random.Random(self.seed + batch_num).shuffle(batch_slice)
+                batch_indices[batch_start:batch_end] = batch_slice
         
         # Handle distributed training - each rank gets its subset
         if self.num_replicas > 1:
