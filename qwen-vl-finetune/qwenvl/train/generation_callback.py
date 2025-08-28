@@ -232,8 +232,8 @@ class GenerationLoggingCallback(TrainerCallback):
                             'step': state.global_step,
                             'example_idx': vla_examples_processed,
                             'input_text': input_text[-500:],  # Last 500 chars to avoid too long
-                            'gt_action_tokens': gt_action_tokens[:20],  # Limit for display
-                            'pred_action_tokens': pred_action_tokens[:20],
+                            'gt_action_tokens': gt_action_tokens,  # Limit for display
+                            'pred_action_tokens': pred_action_tokens,
                             'is_correct': is_correct,
                             'l2_distance': l2_distance,
                             'gt_continuous': gt_continuous.tolist() if gt_continuous is not None else None,
