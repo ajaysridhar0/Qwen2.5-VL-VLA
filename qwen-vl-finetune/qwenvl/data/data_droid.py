@@ -102,7 +102,7 @@ class DroidVLADataset(Dataset):
         return getattr(self.data_args, 'num_droid_samples', 20_000_000)
     
     def _process_image(self, image_array):
-        """Process numpy image array to PIL Image and resize to specified dimensions."""
+        """Process numpy image array to PIL Image and resize with aspect ratio preservation."""
         if isinstance(image_array, np.ndarray):
             # Ensure uint8 type
             if image_array.dtype != np.uint8:
@@ -111,10 +111,7 @@ class DroidVLADataset(Dataset):
         else:
             image = image_array
         
-        # Resize to specified dimensions (height, width) -> (width, height) for PIL
-        if hasattr(self, 'image_size') and self.image_size is not None:
-            target_width, target_height = self.image_size[1], self.image_size[0]  # PIL uses (width, height)
-            image = image.resize((target_width, target_height), Image.Resampling.LANCZOS)
+        # No resizing for VLA data - keep original processing
         
         return image
     

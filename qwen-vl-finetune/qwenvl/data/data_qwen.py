@@ -272,8 +272,6 @@ class LazySupervisedDataset(Dataset):
             try:
                 decord_video = self.video_decord(video_file)
                 return decord_video
-                if decord_video:
-                    break
             except Exception as e:
                 print(f"Decord attempt {decord_attempts + 1} failed: {e}")
                 decord_attempts += 1
@@ -331,7 +329,7 @@ class LazySupervisedDataset(Dataset):
         fps = len(frame_idx) / video_length
         processor = copy.deepcopy(self.data_args.image_processor)
         processor.max_pixels = self.data_args.video_max_frame_pixels
-        s.min_pixels = self.data_args.video_min_frame_pixels
+        processor.min_pixels = self.data_args.video_min_frame_pixels
         processor.size["longest_edge"] = processor.max_pixels
         processor.size["shortest_edge"] = processor.min_pixels
         video_processed = processor.preprocess(

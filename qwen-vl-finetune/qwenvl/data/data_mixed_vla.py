@@ -9,6 +9,7 @@ import transformers
 import random
 import json
 import copy
+import math
 from torch.utils.data import Dataset, DataLoader
 from dataclasses import dataclass
 from typing import Dict, Sequence, List, Optional, Any, Union
@@ -18,191 +19,13 @@ import os
 # Import existing components
 from .data_droid import DroidVLADataset, DroidDataCollator, normalize_action, denormalize_action
 
-# Import only what we need from data_qwen, avoiding video-related imports
-import copy
-import transformers
-from typing import Dict, Optional, Sequence, List, Tuple
-from PIL import Image
-import torch
-
-# Import specific functions we need without importing the full module
-IGNORE_INDEX = -100
-IMAGE_TOKEN_INDEX = 151655
-VIDEO_TOKEN_INDEX = 151656
+# Import the original preprocessing function that handles both image and video tokens
+from .data_qwen import preprocess_qwen_2_visual, IGNORE_INDEX, IMAGE_TOKEN_INDEX, VIDEO_TOKEN_INDEX
 
 def read_jsonl(path):
     """Read JSONL file."""
     with open(path, "r") as f:
         return [json.loads(line) for line in f]
-
-def preprocess_qwen_2_visual(
-    sources,
-    tokenizer: transformers.PreTrainedTokenizer,
-    grid_thw_image: List = [],
-    grid_thw_video: List = [],
-) -> Dict:
-    """Simplified preprocessing for mixed VLA training."""
-    roles = {"human": "user", "gpt": "assistant", "system": "system"}
-    default_system_message = "You are a helpful assistant."
-
-    tokenizer = copy.deepcopy(tokenizer)
-    chat_template = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}"
-    tokenizer.chat_template = chat_template
-
-    visual_replicate_index_image = 0
-    input_ids, targets = [], []
-
-    for i, source in enumerate(sources):
-        # Extract system message from the conversation if present
-        system_message = default_system_message
-        filtered_source = []
-        
-        for msg in source:
-            try:
-                role = msg.get("role", msg.get("from", ""))
-                content = msg.get("content", msg.get("value", ""))
-            except:
-                role = msg.get("from", "")
-                content = msg.get("value", "")
-            
-            if role == "system":
-                system_message = content
-            else:
-                filtered_source.append(msg)
-        
-        source = filtered_source
-        
-        try:
-            if source and roles.get(source[0].get("from", source[0].get("role", "")), "") != roles["human"]:
-                source = source[1:]
-        except:
-            print(sources)
-
-        input_id, target = [], []
-
-        input_id += tokenizer.apply_chat_template(
-            [{"role": "system", "content": system_message}]
-        )
-        target += [IGNORE_INDEX] * len(input_id)
-
-        for conv in source:
-            try:
-                role = conv["role"]
-                content = conv["content"]
-            except:
-                role = conv["from"]
-                content = conv["value"]
-
-            role = roles.get(role, role)
-            if role == "user":
-                if "<image>" in content:
-                    parts = content.split("<image>")
-                    new_parts = []
-                    for i in range(len(parts) - 1):
-                        new_parts.append(parts[i])
-                        # Handle case where grid_thw_image is None or empty
-                        if grid_thw_image and visual_replicate_index_image < len(grid_thw_image):
-                            image_pad_count = grid_thw_image[visual_replicate_index_image]
-                        else:
-                            # Default fallback for missing image data
-                            image_pad_count = 1  # Use minimal padding
-                        
-                        replacement = (
-                            "<|vision_start|>"
-                            + f"<|image_pad|>"
-                            * image_pad_count
-                            + "<|vision_end|>"
-                        )
-                        new_parts.append(replacement)
-                        visual_replicate_index_image += 1
-                    new_parts.append(parts[-1])
-                    content = "".join(new_parts)
-
-            conv = [{"role": role, "content": content}]
-            encode_id = tokenizer.apply_chat_template(conv)
-            input_id += encode_id
-            if role in ["user", "system"]:
-                target += [IGNORE_INDEX] * len(encode_id)
-            else:
-                target_mask = encode_id.copy()
-                target_mask[:3] = [IGNORE_INDEX] * 3
-                target += target_mask
-
-        assert len(input_id) == len(target), f"{len(input_id)} != {len(target)}"
-        input_ids.append(input_id)
-        targets.append(target)
-
-    input_ids = torch.tensor(input_ids, dtype=torch.long)
-    targets = torch.tensor(targets, dtype=torch.long)
-
-    return dict(
-        input_ids=input_ids,
-        labels=targets,
-    )
-
-class DataCollatorForSupervisedDataset(object):
-    """Simplified collator for mixed training."""
-    
-    def __init__(self, tokenizer: transformers.PreTrainedTokenizer):
-        self.tokenizer = tokenizer
-    
-    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids, labels = tuple(
-            [instance[key] for instance in instances]
-            for key in ("input_ids", "labels")
-        )
-        input_ids = [ids.squeeze(0) for ids in input_ids]
-        labels = [ids.squeeze(0) for ids in labels]
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
-        )
-        labels = torch.nn.utils.rnn.pad_sequence(
-            labels, batch_first=True, padding_value=IGNORE_INDEX
-        )
-        
-        batch = dict(
-            input_ids=input_ids,
-            labels=labels,
-            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
-        )
-        
-        # Handle images if present - need to flatten properly for mixed data
-        images = []
-        grid_thws = []
-        
-        for instance in instances:
-            if "pixel_values" in instance and instance["pixel_values"] is not None:
-                pixel_vals = instance["pixel_values"]
-                grid_thw = instance["image_grid_thw"]
-                
-                # Handle different tensor shapes from VLA vs JSON data
-                if pixel_vals.dim() == 3:  # Single image from JSON data: [C, H, W]
-                    images.append(pixel_vals.unsqueeze(0))  # Add batch dim: [1, C, H, W]
-                    if grid_thw.dim() == 1:
-                        grid_thws.append(grid_thw.unsqueeze(0))  # Add batch dim
-                    else:
-                        grid_thws.append(grid_thw)
-                elif pixel_vals.dim() == 4:  # Batch of images: [N, C, H, W]
-                    # Split into individual images
-                    for i in range(pixel_vals.shape[0]):
-                        images.append(pixel_vals[i:i+1])  # Keep batch dim: [1, C, H, W]
-                        if grid_thw.dim() == 2:
-                            grid_thws.append(grid_thw[i:i+1])  # Keep batch dim
-                        else:
-                            grid_thws.append(grid_thw.unsqueeze(0))
-                else:
-                    # Flatten any other dimensions and add to list
-                    images.append(pixel_vals)
-                    grid_thws.append(grid_thw)
-        
-        if len(images) > 0:
-            batch["pixel_values"] = torch.cat(images, dim=0)
-            batch["image_grid_thw"] = torch.cat(grid_thws, dim=0)
-        else:
-            batch["pixel_values"] = None
-            batch["image_grid_thw"] = None
-            
-        return batch
 
 
 def rank0_print(*args):
@@ -314,7 +137,11 @@ class MixedVLADataset(Dataset):
         return self.total_size
     
     def _get_json_item(self, idx):
-        """Get a processed JSON conversational example."""
+        """Get a processed JSON conversational example.
+        
+        Supports mixed media: JSON items can contain both 'image' and 'video' fields.
+        Images are processed as image data, videos are processed as video data.
+        """
         if not self.json_dataset:
             raise ValueError("JSON dataset not loaded")
         
@@ -325,89 +152,102 @@ class MixedVLADataset(Dataset):
         # Process the JSON item similar to LazySupervisedDataset
         sources = [json_item]
         
-        # Handle image processing if present (check both "image" and "video" fields)
-        image_file = None
-        if "image" in json_item:
-            image_file = json_item["image"]
-        elif "video" in json_item:
-            # convert_vla_format.py puts media files under "video" key
-            image_file = json_item["video"]
+        # Process media by type (simplified since order is lost anyway)
+        image_folder = json_item.get("data_path", "")
         
-        if image_file is not None:
-            image_folder = json_item.get("data_path", "")
+        image_tensors = []
+        image_thws = []
+        video_tensors = []
+        video_thws = []
+        
+        # Process images if present
+        if "image" in json_item:
+            image_files = json_item["image"]
+            if not isinstance(image_files, list):
+                image_files = [image_files]
             
-            if isinstance(image_file, list):
-                if len(image_file) > 1:
-                    # Multiple images
-                    image_files = [os.path.join(image_folder, f) for f in image_file]
-                    images = []
-                    grid_thws = []
-                    for img_file in image_files:
-                        if os.path.exists(img_file):
-                            img, thw = self._process_image_unified(img_file)
-                            images.append(img)
-                            if thw.dim() == 1:
-                                thw = thw.unsqueeze(0)
-                            grid_thws.append(thw)
-                    if images:
-                        # Concatenate 2D vision features along the patch dimension
-                        pixel_values = torch.cat(images, dim=0)
-                        image_grid_thw = torch.cat(grid_thws, dim=0)
-                    else:
-                        pixel_values = None
-                        image_grid_thw = None
-                else:
-                    image_file = image_file[0]
-                    image_file = os.path.join(image_folder, image_file)
-                    if os.path.exists(image_file):
-                        pixel_values, image_grid_thw = self._process_image_unified(image_file)
-                        # Keep pixel_values as 2D vision features
-                        # Ensure grid_thw has batch dimension
-                        if image_grid_thw.dim() == 1:
-                            image_grid_thw = image_grid_thw.unsqueeze(0)
-                    else:
-                        pixel_values = None
-                        image_grid_thw = None
-            else:
-                image_file = os.path.join(image_folder, image_file)
-                if os.path.exists(image_file):
-                    pixel_values, image_grid_thw = self._process_image_unified(image_file)
-                    # Keep pixel_values as 2D vision features
+            for image_file in image_files:
+                full_path = os.path.join(image_folder, image_file)
+                if os.path.exists(full_path):
+                    pixel_vals, grid_thw = self._process_image_unified(full_path)
                     # Ensure grid_thw has batch dimension
-                    if image_grid_thw.dim() == 1:
-                        image_grid_thw = image_grid_thw.unsqueeze(0)
-                else:
-                    pixel_values = None
-                    image_grid_thw = None
+                    if grid_thw.dim() == 1:
+                        grid_thw = grid_thw.unsqueeze(0)
+                    image_tensors.append(pixel_vals)
+                    image_thws.append(grid_thw)
+        
+        # Process videos if present
+        if "video" in json_item:
+            video_files = json_item["video"]
+            if not isinstance(video_files, list):
+                video_files = [video_files]
+            
+            # Process as video (multiple frames)
+            if len(video_files) > 1:
+                pixel_vals, grid_thw = self._process_video_from_frames(video_files, image_folder)
+                video_tensors.append(pixel_vals)
+                video_thws.append(grid_thw)
+            else:
+                # Single video frame - still process as video for consistency
+                full_path = os.path.join(image_folder, video_files[0])
+                if os.path.exists(full_path):
+                    pixel_vals, grid_thw = self._process_video_from_frames(video_files, image_folder)
+                    video_tensors.append(pixel_vals)
+                    video_thws.append(grid_thw)
+        
+        # Combine tensors by type
+        if image_tensors:
+            image_pixel_values = torch.cat(image_tensors, dim=0)
+            image_grid_thw = torch.cat(image_thws, dim=0)
         else:
-            pixel_values = None
+            image_pixel_values = None
             image_grid_thw = None
         
+        if video_tensors:
+            video_pixel_values = torch.cat(video_tensors, dim=0)
+            video_grid_thw = torch.cat(video_thws, dim=0)
+        else:
+            video_pixel_values = None
+            video_grid_thw = None
+        
         # Calculate grid_thw_merged for preprocessing
-        grid_thw_merged = None
+        grid_thw_image_merged = None
+        grid_thw_video_merged = None
+        
         if image_grid_thw is not None:
-            grid_thw_merged = [
+            grid_thw_image_merged = [
                 thw.prod() // self.data_args.image_processor.merge_size**2
                 for thw in image_grid_thw
             ]
         
-        # Preprocess conversations
+        if video_grid_thw is not None:
+            # Video uses same token calculation as images (both use merge_size**2 = 4)
+            grid_thw_video_merged = [
+                thw.prod() // self.data_args.image_processor.merge_size**2
+                for thw in video_grid_thw
+            ]
+        
+        # Preprocess conversations using the imported function
         chat_sources = copy.deepcopy([json_item["conversations"]])
         data_dict = preprocess_qwen_2_visual(
             chat_sources,
             self.tokenizer,
-            grid_thw_image=grid_thw_merged,
-            grid_thw_video=None,
+            grid_thw_image=grid_thw_image_merged,
+            grid_thw_video=grid_thw_video_merged,
         )
         
         # Remove batch dimension from tensors to match VLA data format
         data_dict["input_ids"] = data_dict["input_ids"].squeeze(0)
         data_dict["labels"] = data_dict["labels"].squeeze(0)
         
-        # Add image data if present
-        if pixel_values is not None:
-            data_dict["pixel_values"] = pixel_values
+        # Add image and/or video data if present
+        if image_pixel_values is not None:
+            data_dict["pixel_values"] = image_pixel_values
             data_dict["image_grid_thw"] = image_grid_thw
+        
+        if video_pixel_values is not None:
+            data_dict["pixel_values_videos"] = video_pixel_values
+            data_dict["video_grid_thw"] = video_grid_thw
         
         return data_dict
     
@@ -416,19 +256,149 @@ class MixedVLADataset(Dataset):
         processor = copy.deepcopy(self.data_args.image_processor)
         image = Image.open(image_file).convert("RGB")
         
+        # Resize single JSON image based on pixel budget
+        pixel_budget = getattr(self.data_args, 'pixel_budget', 230400)  # Default: 4x VLA size
+        if pixel_budget is not None and pixel_budget > 0:
+            image = self._resize_with_pixel_budget(image, pixel_budget)
+        
         visual_processed = processor.preprocess(image, return_tensors="pt")
         image_tensor = visual_processed["pixel_values"]
         if isinstance(image_tensor, list):
             image_tensor = image_tensor[0]
-        
-        # Debug: check the shape
-        # print(f"_process_image_unified: image_tensor shape after processing: {image_tensor.shape}")
         
         # The Qwen processor returns 2D vision features [num_patches, feature_dim]
         # Keep them as-is since that's what the model expects
             
         grid_thw = visual_processed["image_grid_thw"][0]
         return image_tensor, grid_thw
+    
+    def _resize_with_pixel_budget(self, image, pixel_budget):
+        """Resize image to have at most pixel_budget pixels while preserving aspect ratio."""
+        width, height = image.size
+        current_pixels = width * height
+        
+        # If image already fits within pixel budget, return as is
+        if current_pixels <= pixel_budget:
+            return image
+        
+        # Calculate scaling factor based on pixel budget
+        # scale^2 * current_pixels = pixel_budget
+        scale_factor = math.sqrt(pixel_budget / current_pixels)
+        
+        # Qwen2-VL constraints: both dimensions must be > 28 (IMAGE_FACTOR) and divisible by 28
+        factor = 28
+        min_pixels_per_image = (factor + factor) * (factor + factor)  # 56*56 = 3136 pixels minimum
+        
+        # Helper function to round to nearest factor multiple (must be > factor, not >= factor)
+        def round_to_factor(value, factor):
+            result = round(value / factor) * factor
+            # Ensure result is strictly greater than factor
+            if result <= factor:
+                result = factor + factor  # Next valid multiple (56)
+            return result
+        
+        # Apply scale factor and round to factor multiples
+        scaled_width = width * scale_factor
+        scaled_height = height * scale_factor
+        new_width = round_to_factor(scaled_width, factor)
+        new_height = round_to_factor(scaled_height, factor)
+        
+        # Ensure minimum pixels per image (in case one dimension is very small)
+        current_pixels_after_resize = new_width * new_height
+        if current_pixels_after_resize < min_pixels_per_image:
+            # Scale up to meet minimum pixels while preserving aspect ratio
+            aspect_ratio = width / height
+            if aspect_ratio >= 1:  # Width >= Height
+                target_width = math.ceil(math.sqrt(min_pixels_per_image * aspect_ratio) / factor) * factor
+                if target_width <= factor:
+                    target_width = factor + factor
+                target_height = round_to_factor(target_width / aspect_ratio, factor)
+            else:  # Height > Width
+                target_height = math.ceil(math.sqrt(min_pixels_per_image / aspect_ratio) / factor) * factor
+                if target_height <= factor:
+                    target_height = factor + factor
+                target_width = round_to_factor(target_height * aspect_ratio, factor)
+            new_width = target_width
+            new_height = target_height
+        
+        # If we still exceed pixel budget after minimum constraints, we need to accept it
+        # (minimum constraints take precedence over pixel budget to avoid processing errors)
+        
+        # Resize image
+        return image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    
+    def _process_video_from_frames(self, frame_files, image_folder):
+        """Process video from a list of frame image paths using video-specific processing."""
+        if not isinstance(frame_files, list) or len(frame_files) <= 1:
+            raise ValueError("Expected multiple frame files for video processing")
+        
+        # Load frames
+        frames = []
+        for frame_file in frame_files:
+            frame_path = os.path.join(image_folder, frame_file)
+            if os.path.exists(frame_path):
+                # try:
+                img = Image.open(frame_path).convert("RGB")
+                frames.append(np.array(img))
+                # except Exception as e:
+                #     print(f"Failed to load frame {frame_path}: {e}")
+                #     continue
+        
+        if not frames:
+            raise ValueError("No frames could be loaded")
+        
+        # Convert to numpy array with shape (num_frames, height, width, channels)
+        video = np.stack(frames)
+        
+        # Determine frame sampling
+        total_frames = len(frames)
+        video_min_frames = getattr(self.data_args, "video_min_frames", 4)
+        video_max_frames = getattr(self.data_args, "video_max_frames", 8)
+        
+        # Sample frames if needed
+        if total_frames > video_max_frames:
+            frame_idx = np.linspace(0, total_frames - 1, video_max_frames, dtype=int)
+            frame_idx = np.unique(frame_idx)
+            video = video[frame_idx]
+        else:
+            frame_idx = np.arange(total_frames)
+        
+        # Assume 1 fps for frame sequences (can be adjusted)
+        video_length = len(frame_idx)
+        
+        return self._process_video_frames(video, frame_idx, video_length)
+    
+    def _process_video_frames(self, video, frame_idx, video_length):
+        """Process video frames using the video processor."""
+        fps = len(frame_idx) / video_length
+        processor = copy.deepcopy(self.data_args.image_processor)
+        
+        # Set video-specific processing parameters if available
+        if hasattr(self.data_args, 'video_max_frame_pixels'):
+            processor.max_pixels = self.data_args.video_max_frame_pixels
+        if hasattr(self.data_args, 'video_min_frame_pixels'):
+            processor.min_pixels = self.data_args.video_min_frame_pixels
+        
+        # Process video
+        video_processed = processor.preprocess(
+            images=None, 
+            videos=video, 
+            return_tensors="pt",
+            min_pixels=self.data_args.video_min_frame_pixels,
+            max_pixels=self.data_args.video_max_frame_pixels,
+        )
+        video_tensor = video_processed["pixel_values_videos"]
+        grid_thw = video_processed["video_grid_thw"]
+        
+        # Handle grid_thw format
+        if isinstance(grid_thw, list) and len(grid_thw) > 0:
+            grid_thw = grid_thw[0]
+        
+        # Ensure grid_thw has proper shape
+        if grid_thw.dim() == 1:
+            grid_thw = grid_thw.unsqueeze(0)
+        
+        return video_tensor, grid_thw
     
     def __getitem__(self, idx):
         """Get a mixed training example - either VLA or JSON based on ratio."""
@@ -511,24 +481,17 @@ class MixedVLADataCollator:
             "attention_mask": attention_mask,
         }
         
-        # Handle images - collect all pixel values and grid_thw
+        # Handle images and videos - collect all pixel values and grid_thw
         all_pixel_values = []
         all_grid_thw = []
+        all_video_values = []
+        all_video_grid_thw = []
         
         for instance in instances:
+            # Handle image data (can coexist with video data)
             if "pixel_values" in instance and instance["pixel_values"] is not None:
                 pixel_vals = instance["pixel_values"]
                 grid_thw = instance["image_grid_thw"]
-                
-                # Debug print
-                # print(f"Pixel values shape: {pixel_vals.shape}, dim: {pixel_vals.dim()}")
-                
-                # Qwen models use 2D vision features, not raw pixel values
-                # The shapes are [num_patches, feature_dim] for processed vision tokens
-                # We need to handle them as-is without adding dimensions
-                
-                # For consistency in concatenation, keep all as separate items
-                # The model expects these 2D vision features directly
                 
                 # Ensure grid_thw is 2D: [N, 3]
                 if grid_thw.dim() == 1:  # [3] -> [1, 3]
@@ -536,7 +499,7 @@ class MixedVLADataCollator:
                 elif grid_thw.dim() == 2:  # [N, 3] - already correct
                     pass
                 else:
-                    print(f"Warning: Unexpected grid_thw dimensions: {grid_thw.shape}")
+                    print(f"Warning: Unexpected image grid_thw dimensions: {grid_thw.shape}")
                     # Try to reshape to [N, 3]
                     if grid_thw.numel() % 3 == 0:
                         grid_thw = grid_thw.reshape(-1, 3)
@@ -545,15 +508,43 @@ class MixedVLADataCollator:
                 
                 all_pixel_values.append(pixel_vals)
                 all_grid_thw.append(grid_thw)
+            
+            # Handle video data (can coexist with image data)
+            if "pixel_values_videos" in instance and instance["pixel_values_videos"] is not None:
+                video_vals = instance["pixel_values_videos"]
+                video_grid_thw = instance["video_grid_thw"]
+                
+                # Ensure video_grid_thw is 2D: [N, 3]
+                if video_grid_thw.dim() == 1:  # [3] -> [1, 3]
+                    video_grid_thw = video_grid_thw.unsqueeze(0)
+                elif video_grid_thw.dim() == 2:  # [N, 3] - already correct
+                    pass
+                else:
+                    print(f"Warning: Unexpected video grid_thw dimensions: {video_grid_thw.shape}")
+                    # Try to reshape to [N, 3]
+                    if video_grid_thw.numel() % 3 == 0:
+                        video_grid_thw = video_grid_thw.reshape(-1, 3)
+                    else:
+                        continue
+                
+                all_video_values.append(video_vals)
+                all_video_grid_thw.append(video_grid_thw)
         
+        # Set image data
         if all_pixel_values:
-            # Concatenate vision features and grid_thw
-            # The pixel_values are 2D vision features from Qwen processor
             batch["pixel_values"] = torch.cat(all_pixel_values, dim=0)
             batch["image_grid_thw"] = torch.cat(all_grid_thw, dim=0)
         else:
             batch["pixel_values"] = None
             batch["image_grid_thw"] = None
+        
+        # Set video data
+        if all_video_values:
+            batch["pixel_values_videos"] = torch.cat(all_video_values, dim=0)
+            batch["video_grid_thw"] = torch.cat(all_video_grid_thw, dim=0)
+        else:
+            batch["pixel_values_videos"] = None
+            batch["video_grid_thw"] = None
         
         return batch
 
@@ -567,6 +558,7 @@ def make_mixed_vla_data_module(
     image_size: tuple = (180, 320),
     cotrain_json_ratio: float = 0.2,
     create_eval_dataset: bool = True,
+    use_fixed_ratio_sampler: bool = True,  # New parameter to enable fixed ratio sampling
 ) -> Dict:
     """Make dataset and collator for mixed VLA + JSON co-training."""
     
@@ -613,8 +605,25 @@ def make_mixed_vla_data_module(
         model_max_length=model_max_length
     )
     
+    # Create custom sampler for fixed ratio batching if using mixed training
+    train_sampler = None
+    if use_fixed_ratio_sampler and train_dataset.json_dataset and 0 < cotrain_json_ratio < 1:
+        from .fixed_ratio_sampler import DistributedFixedRatioSampler
+        
+        # Get batch size from training args (will be set by trainer)
+        # For now, we'll return the sampler class and params to be instantiated by trainer
+        train_sampler_params = {
+            "dataset_size": len(train_dataset),
+            "json_ratio": cotrain_json_ratio,
+            "sampler_class": DistributedFixedRatioSampler,
+        }
+        print(f"Fixed ratio sampler configured with {cotrain_json_ratio:.2f} JSON ratio per batch")
+    else:
+        train_sampler_params = None
+    
     return dict(
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=data_collator
+        data_collator=data_collator,
+        train_sampler_params=train_sampler_params,  # Return sampler params instead of instantiated sampler
     )

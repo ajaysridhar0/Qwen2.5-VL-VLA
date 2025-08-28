@@ -20,8 +20,14 @@ Expected format:
         {"from": "human", "value": "combined text content with <image> tokens"},
         {"from": "gpt", "value": "response text"}
     ],
-    "video": ["path1.png", "path2.png", ...] or "path.png" for single frame
+    "video": ["path1.png", "path2.png", ...] or "path.png" for single frame,
+    "image": ["path1.jpg", "path2.jpg", ...] or "path.jpg" for single image
 }
+
+Media type detection:
+- Paths starting with "images/" are treated as images -> "image" field
+- Paths starting with "videos/" are treated as video frames -> "video" field
+- Mixed or unrecognized paths default to "video" for backward compatibility
 """
 
 import json
@@ -30,54 +36,55 @@ import os
 from typing import List, Dict, Any, Union
 
 
-def convert_content_list_to_text(content_list: List[Dict[str, Any]], base_path: str = None) -> tuple[str, List[str]]:
+def convert_content_list_to_text(content_list: List[Dict[str, Any]], base_path: str = None) -> tuple[str, List[tuple[str, str]]]:
     """
-    Convert content list to text string and extract media files.
+    Convert content list to text string and extract media files with their types.
     
     Args:
         content_list: List of content items with text/image/video
         base_path: Optional base directory path to prepend to relative media paths
     
     Returns:
-        tuple: (combined_text, media_files)
+        tuple: (combined_text, media_files_with_types)
+        where media_files_with_types is a list of (file_path, media_type) tuples
     """
     text_parts = []
-    media_files = []
+    media_files_with_types = []
     
     for content_item in content_list:
         if "text" in content_item:
             text_parts.append(content_item["text"])
-        elif "video" in content_item:
-            # Add image token for each video frame
-            frames = content_item["video"]
-            if isinstance(frames, list):
-                for frame in frames:
-                    text_parts.append("<image>")
-                    # Prepend base_path if provided and frame is relative
-                    full_path = os.path.join(base_path, frame) if base_path and not os.path.isabs(frame) else frame
-                    media_files.append(full_path)
-            else:
-                text_parts.append("<image>")
-                # Prepend base_path if provided and frame is relative
-                full_path = os.path.join(base_path, frames) if base_path and not os.path.isabs(frames) else frames
-                media_files.append(full_path)
         elif "image" in content_item:
-            # Handle image content if present
+            # Handle image content
             images = content_item["image"]
             if isinstance(images, list):
                 for image in images:
                     text_parts.append("<image>")
                     # Prepend base_path if provided and image is relative
                     full_path = os.path.join(base_path, image) if base_path and not os.path.isabs(image) else image
-                    media_files.append(full_path)
+                    media_files_with_types.append((full_path, 'image'))
             else:
                 text_parts.append("<image>")
                 # Prepend base_path if provided and image is relative
                 full_path = os.path.join(base_path, images) if base_path and not os.path.isabs(images) else images
-                media_files.append(full_path)
+                media_files_with_types.append((full_path, 'image'))
+        elif "video" in content_item:
+            # Handle video content
+            frames = content_item["video"]
+            text_parts.append("<video>")
+            if isinstance(frames, list):
+                for frame in frames:
+                    # Prepend base_path if provided and frame is relative
+                    full_path = os.path.join(base_path, frame) if base_path and not os.path.isabs(frame) else frame
+                    media_files_with_types.append((full_path, 'video'))
+            else:
+                # Prepend base_path if provided and frame is relative
+                full_path = os.path.join(base_path, frames) if base_path and not os.path.isabs(frames) else frames
+                media_files_with_types.append((full_path, 'video'))
+        
     
     combined_text = "\n".join(text_parts).strip()
-    return combined_text, media_files
+    return combined_text, media_files_with_types
 
 
 def convert_vla_item(vla_item: Dict[str, Any], base_path: str = None) -> Dict[str, Any]:
@@ -93,7 +100,7 @@ def convert_vla_item(vla_item: Dict[str, Any], base_path: str = None) -> Dict[st
     
     message_list = vla_item["message_list"]
     conversations = []
-    all_media_files = []
+    all_media_files_with_types = []
     
     # Role mapping
     role_mapping = {
@@ -109,9 +116,9 @@ def convert_vla_item(vla_item: Dict[str, Any], base_path: str = None) -> Dict[st
         if not isinstance(content, list):
             # Handle case where content is already a string
             content_text = str(content)
-            media_files = []
+            media_files_with_types = []
         else:
-            content_text, media_files = convert_content_list_to_text(content, base_path)
+            content_text, media_files_with_types = convert_content_list_to_text(content, base_path)
         
         # Map role
         mapped_role = role_mapping.get(role, role)
@@ -125,20 +132,50 @@ def convert_vla_item(vla_item: Dict[str, Any], base_path: str = None) -> Dict[st
                 "value": content_text
             })
         
-        # Collect media files
-        all_media_files.extend(media_files)
+        # Collect media files with their types
+        all_media_files_with_types.extend(media_files_with_types)
     
     # Build result
     result = {
         "conversations": conversations
     }
     
-    # Add media files if present
-    if all_media_files:
-        if len(all_media_files) == 1:
-            result["video"] = all_media_files[0]  # Single frame
-        else:
-            result["video"] = all_media_files  # Multiple frames
+    # Add media files if present, preserving order and type
+    if all_media_files_with_types:
+        # Create ordered media structure that preserves both order and type
+        result["media_sequence"] = []
+        current_group = {"type": None, "files": []}
+        
+        for file_path, media_type in all_media_files_with_types:
+            if current_group["type"] == media_type:
+                # Same type, add to current group
+                current_group["files"].append(file_path)
+            else:
+                # Different type, save current group and start new one
+                if current_group["type"] is not None:
+                    result["media_sequence"].append(current_group)
+                current_group = {"type": media_type, "files": [file_path]}
+        
+        # Add the final group
+        if current_group["type"] is not None:
+            result["media_sequence"].append(current_group)
+        
+        # Also maintain backward compatibility with old field names
+        # Extract all images and videos for compatibility
+        image_files = [path for path, media_type in all_media_files_with_types if media_type == 'image']
+        video_files = [path for path, media_type in all_media_files_with_types if media_type == 'video']
+        
+        if image_files:
+            if len(image_files) == 1:
+                result["image"] = image_files[0]
+            else:
+                result["image"] = image_files
+        
+        if video_files:
+            if len(video_files) == 1:
+                result["video"] = video_files[0]
+            else:
+                result["video"] = video_files
     
     # Preserve original metadata if needed
     if "qid" in vla_item:
@@ -174,13 +211,9 @@ def convert_vla_dataset(input_file: str, output_file: str, base_path: str = None
     errors = []
     
     for i, vla_item in enumerate(vla_data):
-        try:
-            converted_item = convert_vla_item(vla_item, base_path)
-            converted_data.append(converted_item)
-        except Exception as e:
-            error_msg = f"Error converting item {i} (qid: {vla_item.get('qid', 'unknown')}): {str(e)}"
-            errors.append(error_msg)
-            print(f"WARNING: {error_msg}")
+        converted_item = convert_vla_item(vla_item, base_path)
+        converted_data.append(converted_item)
+       
     
     print(f"Successfully converted {len(converted_data)} items")
     if errors:

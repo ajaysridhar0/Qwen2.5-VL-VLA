@@ -40,6 +40,7 @@ from qwenvl.train.generation_callback import GenerationLoggingCallback
 from transformers import AutoTokenizer, AutoProcessor, Qwen2VLImageProcessor, Trainer
 # from qwenvl.train.trainer import EMATrainer  # TODO: Uncomment when implementing custom EMA
 from dataclasses import dataclass, field
+from torch.utils.data import DataLoader
 
 local_rank = None
 
@@ -47,6 +48,43 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
+
+
+class VLATrainer(Trainer):
+    """Custom trainer that supports fixed ratio sampling for mixed VLA/JSON training."""
+    
+    def __init__(self, *args, train_sampler_params=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.train_sampler_params = train_sampler_params
+    
+    def _get_train_sampler(self):
+        """Override to use our custom fixed ratio sampler if params are provided."""
+        if self.train_sampler_params is not None:
+            # Extract sampler class and params
+            sampler_class = self.train_sampler_params["sampler_class"]
+            dataset_size = self.train_sampler_params["dataset_size"]
+            json_ratio = self.train_sampler_params["json_ratio"]
+            
+            # Create the sampler with proper batch size
+            sampler = sampler_class(
+                dataset_size=dataset_size,
+                batch_size=self.args.per_device_train_batch_size,
+                json_ratio=json_ratio,
+                num_replicas=self.args.world_size,
+                rank=self.args.process_index,
+                shuffle=True,
+                seed=self.args.seed,
+                drop_last=self.args.dataloader_drop_last,
+            )
+            
+            rank0_print(f"Using FixedRatioSampler with {json_ratio:.2f} JSON ratio per batch")
+            rank0_print(f"  JSON samples per batch: {sampler.json_per_batch}")
+            rank0_print(f"  VLA samples per batch: {sampler.vla_per_batch}")
+            
+            return sampler
+        else:
+            # Use default sampler
+            return super()._get_train_sampler()
 
 
 @dataclass
@@ -71,6 +109,8 @@ class VLADataArguments(DataArguments):
     enable_cotrain: bool = field(default=False, metadata={"help": "Enable co-training with regular JSON data"})
     cotrain_json_paths: str = field(default="", metadata={"help": "Comma-separated paths to JSON/JSONL files for co-training"})
     cotrain_json_ratio: float = field(default=0.2, metadata={"help": "Ratio of regular JSON data in mixed training (0.0-1.0)"})
+    use_fixed_ratio_sampler: bool = field(default=True, metadata={"help": "Use fixed ratio sampler to ensure consistent memory usage per batch"})
+    pixel_budget: int = field(default=230400, metadata={"help": "Max pixels per JSON query (default: 230400 = 4x VLA size). For multi-frame JSON, budget applies to total pixels across all frames."})
     
 
 
@@ -282,6 +322,7 @@ def train(attn_implementation="flash_attention_2"):
         rank0_print(f"Co-training enabled with {len(json_paths)} JSON datasets")
         rank0_print(f"JSON ratio: {data_args.cotrain_json_ratio:.2f}")
         rank0_print(f"JSON paths: {json_paths}")
+        rank0_print(f"Pixel budget: {data_args.pixel_budget:,} pixels per JSON query (VLA data unchanged)")
         
         data_module = make_mixed_vla_data_module(
             tokenizer=tokenizer,
@@ -291,10 +332,12 @@ def train(attn_implementation="flash_attention_2"):
             token_mappings=token_mappings,
             image_size=(data_args.image_height, data_args.image_width),
             cotrain_json_ratio=data_args.cotrain_json_ratio,
+            use_fixed_ratio_sampler=data_args.use_fixed_ratio_sampler,
         )
     else:
         # Standard VLA-only training
         rank0_print("VLA-only training (no co-training)")
+        rank0_print(f"Pixel budget: {data_args.pixel_budget:,} pixels per JSON query (VLA data unchanged)")
         data_module = make_droid_data_module(
             tokenizer=tokenizer, 
             action_tokenizer=action_tokenizer,
@@ -315,17 +358,20 @@ def train(attn_implementation="flash_attention_2"):
         log_to_wandb=training_args.log_generations_to_wandb,
     )
     
+    # Extract sampler params if present
+    train_sampler_params = data_module.pop('train_sampler_params', None)
+    
     # Initialize trainer with callback
-    trainer = Trainer(
+    trainer = VLATrainer(
         model=model, 
         processing_class=tokenizer, 
         args=training_args, 
         callbacks=[generation_callback],
+        train_sampler_params=train_sampler_params,  # Pass sampler params to custom trainer
         **data_module
     )
     
     # Set up the callback with trainer components
-    breakpoint()
     generation_callback.setup_trainer_components(
         model=model,
         eval_dataloader=trainer.get_eval_dataloader() if data_module['eval_dataset'] is not None else None
