@@ -20,7 +20,14 @@ import os
 from .data_droid import DroidVLADataset, DroidDataCollator, normalize_action, denormalize_action
 
 # Import the original preprocessing function that handles both image and video tokens
-from .data_qwen import preprocess_qwen_2_visual, IGNORE_INDEX, IMAGE_TOKEN_INDEX, VIDEO_TOKEN_INDEX
+from .data_qwen import (
+    preprocess_qwen_2_visual, 
+    IGNORE_INDEX, 
+    IMAGE_TOKEN_INDEX, 
+    VIDEO_TOKEN_INDEX,
+    pad_and_cat,  # For padding position_ids
+)
+from .rope2d import get_rope_index_25, get_rope_index_2
 
 def read_jsonl(path):
     """Read JSONL file."""
@@ -35,6 +42,55 @@ def rank0_print(*args):
             print(*args)
     else:
         print(*args)
+
+
+def resize_image_with_constraints(image, max_dim=320, min_dim=28):
+    """
+    Resize an image such that:
+    - The maximum dimension (width or height) does not exceed max_dim
+    - The minimum dimension (width or height) is at least min_dim
+    - Aspect ratio is preserved
+    
+    Args:
+        image: PIL Image to resize
+        max_dim: Maximum allowed dimension 
+        min_dim: Minimum required dimension
+        
+    Returns:
+        PIL Image: Resized image
+    """
+    if not isinstance(image, Image.Image):
+        raise ValueError("Input must be a PIL Image")
+        
+    width, height = image.size
+    
+    # Calculate the scaling factor based on max dimension constraint
+    max_scale = min(max_dim / width, max_dim / height)
+    
+    # Calculate new dimensions with max constraint
+    new_width = int(width * max_scale)
+    new_height = int(height * max_scale)
+    
+    # Check if min dimension constraint is satisfied
+    min_current_dim = min(new_width, new_height)
+    if min_current_dim < min_dim:
+        # Scale up to meet min dimension requirement
+        min_scale = min_dim / min_current_dim
+        new_width = int(new_width * min_scale)
+        new_height = int(new_height * min_scale)
+        
+        # Ensure we didn't violate max constraint after min scaling
+        # If we did, prioritize max constraint (this is edge case handling)
+        if max(new_width, new_height) > max_dim:
+            # Revert to max constraint scaling
+            new_width = int(width * max_scale)
+            new_height = int(height * max_scale)
+    
+    # Only resize if dimensions actually changed
+    if new_width != width or new_height != height:
+        image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    
+    return image
 
 
 class MixedVLADataset(Dataset):
@@ -60,6 +116,10 @@ class MixedVLADataset(Dataset):
         self.image_size = image_size
         self.cotrain_json_ratio = cotrain_json_ratio
         
+        # Create a helper instance to access image/video processing methods from data_qwen.py
+        # This ensures we use the tested functions that work properly with gradient checkpointing
+        self._qwen_dataset_helper = self._create_qwen_helper(tokenizer, data_args)
+        
         # Initialize VLA dataset
         self.vla_dataset = DroidVLADataset(
             tokenizer=tokenizer,
@@ -69,6 +129,11 @@ class MixedVLADataset(Dataset):
             token_mappings=token_mappings,
             image_size=image_size,
         )
+
+        if data_args.model_type == "qwen2.5vl":
+            self.get_rope_index = get_rope_index_25
+        else:
+            self.get_rope_index = get_rope_index_2
         
         # Initialize regular JSON dataset if co-training is enabled
         self.json_dataset = None
@@ -133,6 +198,111 @@ class MixedVLADataset(Dataset):
         
         return json_data
     
+    def _create_qwen_helper(self, tokenizer, data_args):
+        """Create a minimal helper object with just the image/video processing methods."""
+        class QwenProcessingHelper:
+            def __init__(self, tokenizer, data_args):
+                self.tokenizer = tokenizer
+                self.data_args = data_args
+                
+                # Set up rope index function based on model type
+                if hasattr(data_args, 'model_type') and data_args.model_type == "qwen2.5vl":
+                    from .rope2d import get_rope_index_25
+                    self.get_rope_index = get_rope_index_25
+                else:
+                    from .rope2d import get_rope_index_2
+                    self.get_rope_index = get_rope_index_2
+                
+                # Video processing parameters
+                self.video_max_total_pixels = getattr(data_args, "video_max_total_pixels", 1664 * 28 * 28)
+                self.video_min_total_pixels = getattr(data_args, "video_min_total_pixels", 256 * 28 * 28)
+                
+                # Image resize constraints
+                self.max_image_dim = getattr(data_args, "max_image_dim", 320)
+                self.min_image_dim = getattr(data_args, "min_image_dim", 28)
+            
+            def process_image_unified(self, image_file):
+                """Process a single image file."""
+                processor = copy.deepcopy(self.data_args.image_processor)
+                image = Image.open(image_file).convert("RGB")
+                
+                # Apply resize constraints before preprocessing
+                image = resize_image_with_constraints(
+                    image, 
+                    max_dim=self.max_image_dim, 
+                    min_dim=self.min_image_dim
+                )
+                
+                visual_processed = processor.preprocess(image, return_tensors="pt")
+                image_tensor = visual_processed["pixel_values"]
+                if isinstance(image_tensor, list):
+                    image_tensor = image_tensor[0]
+                grid_thw = visual_processed["image_grid_thw"][0]
+                return image_tensor, grid_thw
+            
+            def process_video_from_frames(self, frame_paths):
+                """Process video from a list of frame image paths."""
+                # Load frames
+                frames = []
+                for frame_path in frame_paths:
+                    try:
+                        img = Image.open(frame_path).convert("RGB")
+                        # Apply resize constraints to each frame
+                        img = resize_image_with_constraints(
+                            img, 
+                            max_dim=self.max_image_dim, 
+                            min_dim=self.min_image_dim
+                        )
+                        frames.append(np.array(img))
+                    except Exception as e:
+                        print(f"Failed to load frame {frame_path}: {e}")
+                        continue
+                
+                if not frames:
+                    raise ValueError("No frames could be loaded")
+                
+                # Convert to numpy array with shape (num_frames, height, width, channels)
+                video = np.stack(frames)
+                
+                # Determine frame sampling
+                total_frames = len(frames)
+                video_min_frames = getattr(self.data_args, "video_min_frames", 4)
+                video_max_frames = getattr(self.data_args, "video_max_frames", 8)
+                
+                # Sample frames if needed
+                if total_frames > video_max_frames:
+                    frame_idx = np.linspace(0, total_frames - 1, video_max_frames, dtype=int)
+                    frame_idx = np.unique(frame_idx)
+                    video = video[frame_idx]
+                else:
+                    frame_idx = np.arange(total_frames)
+                
+                # Assume 1 fps for frame sequences (can be adjusted)
+                video_length = len(frame_idx)
+                
+                return self.process_video_frames(video, frame_idx, video_length)
+            
+            def process_video_frames(self, video, frame_idx, video_length):
+                """Process video frames using the video processor."""
+                fps = len(frame_idx) / video_length
+                processor = copy.deepcopy(self.data_args.image_processor)
+                processor.max_pixels = getattr(self.data_args, 'video_max_frame_pixels', self.data_args.image_processor.max_pixels)
+                processor.min_pixels = getattr(self.data_args, 'video_min_frame_pixels', self.data_args.image_processor.min_pixels)
+                processor.size["longest_edge"] = processor.max_pixels
+                processor.size["shortest_edge"] = processor.min_pixels
+                
+                video_processed = processor.preprocess(
+                    images=None, videos=video, return_tensors="pt"
+                )
+                video_tensor = video_processed["pixel_values_videos"]
+                grid_thw = video_processed["video_grid_thw"][0]
+                second_per_grid_ts = [
+                    self.data_args.image_processor.temporal_patch_size / fps
+                ] * len(grid_thw)
+                return video_tensor, grid_thw, second_per_grid_ts
+        
+        return QwenProcessingHelper(tokenizer, data_args)
+    
     def __len__(self):
         return self.total_size
     
@@ -151,254 +321,120 @@ class MixedVLADataset(Dataset):
         
         # Process the JSON item similar to LazySupervisedDataset
         sources = [json_item]
-        
-        # Process media by type (simplified since order is lost anyway)
-        image_folder = json_item.get("data_path", "")
-        
-        image_tensors = []
-        image_thws = []
-        video_tensors = []
-        video_thws = []
-        
-        # Process images if present
-        if "image" in json_item:
-            image_files = json_item["image"]
-            if not isinstance(image_files, list):
-                image_files = [image_files]
-            
-            for image_file in image_files:
-                full_path = os.path.join(image_folder, image_file)
-                if os.path.exists(full_path):
-                    pixel_vals, grid_thw = self._process_image_unified(full_path)
-                    # Ensure grid_thw has batch dimension
-                    if grid_thw.dim() == 1:
-                        grid_thw = grid_thw.unsqueeze(0)
-                    image_tensors.append(pixel_vals)
-                    image_thws.append(grid_thw)
-        
-        # Process videos if present
-        if "video" in json_item:
-            video_files = json_item["video"]
-            if not isinstance(video_files, list):
-                video_files = [video_files]
-            
-            # Process as video (multiple frames)
-            if len(video_files) > 1:
-                pixel_vals, grid_thw = self._process_video_from_frames(video_files, image_folder)
-                video_tensors.append(pixel_vals)
-                video_thws.append(grid_thw)
+
+        # define some variables
+        grid_thw_merged = None
+        video_grid_thw_merged = None
+        grid_thw = None
+        video_grid_thw = None
+        second_per_grid_ts = None
+
+        if "image" in sources[0]:
+            image_file = json_item["image"]
+            if isinstance(image_file, List):
+                if len(image_file) > 1:
+                    results = [self.process_image_unified(file) for file in image_file]
+                    image, grid_thw = zip(*results)
+                else:
+                    image_file = image_file[0]
+                    image, grid_thw = self.process_image_unified(image_file)
+                    image = [image]
             else:
-                # Single video frame - still process as video for consistency
-                full_path = os.path.join(image_folder, video_files[0])
-                if os.path.exists(full_path):
-                    pixel_vals, grid_thw = self._process_video_from_frames(video_files, image_folder)
-                    video_tensors.append(pixel_vals)
-                    video_thws.append(grid_thw)
-        
-        # Combine tensors by type
-        if image_tensors:
-            image_pixel_values = torch.cat(image_tensors, dim=0)
-            image_grid_thw = torch.cat(image_thws, dim=0)
-        else:
-            image_pixel_values = None
-            image_grid_thw = None
-        
-        if video_tensors:
-            video_pixel_values = torch.cat(video_tensors, dim=0)
-            video_grid_thw = torch.cat(video_thws, dim=0)
-        else:
-            video_pixel_values = None
-            video_grid_thw = None
-        
-        # Calculate grid_thw_merged for preprocessing
-        grid_thw_image_merged = None
-        grid_thw_video_merged = None
-        
-        if image_grid_thw is not None:
-            grid_thw_image_merged = [
-                thw.prod() // self.data_args.image_processor.merge_size**2
-                for thw in image_grid_thw
+                image, grid_thw = self.process_image_unified(image_file)
+                image = [image]
+            grid_thw_merged = copy.deepcopy(grid_thw)
+            if not isinstance(grid_thw, Sequence):
+                grid_thw_merged = [grid_thw_merged]
+                grid_thw = [grid_thw]
+            grid_thw_merged = [
+                merged_thw.prod() // self.data_args.image_processor.merge_size**2
+                for merged_thw in grid_thw_merged
             ]
-        
-        if video_grid_thw is not None:
-            # Video uses same token calculation as images (both use merge_size**2 = 4)
-            grid_thw_video_merged = [
-                thw.prod() // self.data_args.image_processor.merge_size**2
-                for thw in video_grid_thw
+        if "video" in sources[0]:
+            video_file = json_item["video"]
+            if not isinstance(video_file, List):
+                video_file = [video_file]
+            # else:
+                # if len(video_file) > 1:
+            results = [self.process_video_from_frames(video_file)]
+            video, video_grid_thw, second_per_grid_ts = zip(*results)
+                # else:
+                #     video_file = video_file[0]
+                #     video, video_grid_thw, second_per_grid_ts = self.process_video(
+                #         video_file
+                #     )
+                #     video = [video]
+            # else:
+            #     video, video_grid_thw, second_per_grid_ts = self.process_video(
+            #         video_file
+            #     )
+            #     video = [video]
+            video_grid_thw_merged = copy.deepcopy(video_grid_thw)
+            if not isinstance(video_grid_thw, Sequence):
+                video_grid_thw_merged = [video_grid_thw_merged]
+                video_grid_thw = [video_grid_thw]
+            video_grid_thw_merged = [
+                merged_thw.prod() // self.data_args.image_processor.merge_size**2
+                for merged_thw in video_grid_thw_merged
             ]
-        
-        # Preprocess conversations using the imported function
-        chat_sources = copy.deepcopy([json_item["conversations"]])
+        chat_sources = copy.deepcopy([e["conversations"] for e in sources])
         data_dict = preprocess_qwen_2_visual(
             chat_sources,
             self.tokenizer,
-            grid_thw_image=grid_thw_image_merged,
-            grid_thw_video=grid_thw_video_merged,
+            grid_thw_image=grid_thw_merged if grid_thw_merged else None,
+            grid_thw_video=video_grid_thw_merged if video_grid_thw_merged else None,
         )
-        
-        # Remove batch dimension from tensors to match VLA data format
-        data_dict["input_ids"] = data_dict["input_ids"].squeeze(0)
-        data_dict["labels"] = data_dict["labels"].squeeze(0)
-        
-        # Add image and/or video data if present
-        if image_pixel_values is not None:
-            data_dict["pixel_values"] = image_pixel_values
-            data_dict["image_grid_thw"] = image_grid_thw
-        
-        if video_pixel_values is not None:
-            data_dict["pixel_values_videos"] = video_pixel_values
-            data_dict["video_grid_thw"] = video_grid_thw
-        
+        position_ids, _ = self.get_rope_index(
+            self.data_args.image_processor.merge_size,
+            data_dict["input_ids"],
+            image_grid_thw=torch.stack(grid_thw, dim=0) if grid_thw else None,
+            video_grid_thw=(
+                torch.stack(video_grid_thw, dim=0) if video_grid_thw else None
+            ),
+            second_per_grid_ts=None,
+        )
+        if "image" not in sources[0] and "video" not in sources[0]:
+            grid_thw_merged = None
+            sources = copy.deepcopy([e["conversations"] for e in sources])
+            data_dict = preprocess_qwen_2_visual(
+                sources, self.tokenizer, grid_thw=grid_thw_merged
+            )
+            position_ids = (
+                torch.arange(0, data_dict["input_ids"].size(1))
+                .view(1, -1)
+                .unsqueeze(0)
+                .expand(3, -1, -1)
+            )
+
+        data_dict["position_ids"] = position_ids
+        data_dict["attention_mask"] = [data_dict["input_ids"][0].size(0)]
+
+        if "image" in json_item:
+            data_dict["pixel_values"] = torch.cat(image, dim=0)
+            data_dict["image_grid_thw"] = torch.cat(
+                [thw.unsqueeze(0) for thw in grid_thw], dim=0
+            )
+        # video exist in the data
+        if "video" in json_item:
+            data_dict["pixel_values_videos"] = torch.cat(video, dim=0)
+            data_dict["video_grid_thw"] = torch.cat(
+                [thw.unsqueeze(0) for thw in video_grid_thw], dim=0
+            )
+
         return data_dict
+
+    def process_image_unified(self, image_file):
+        """Process a single image file for JSON data using the tested function from data_qwen.py."""
+        return self._qwen_dataset_helper.process_image_unified(image_file)
     
-    def _process_image_unified(self, image_file):
-        """Process a single image file for JSON data."""
-        processor = copy.deepcopy(self.data_args.image_processor)
-        image = Image.open(image_file).convert("RGB")
-        
-        # Resize single JSON image based on pixel budget
-        pixel_budget = getattr(self.data_args, 'pixel_budget', 230400)  # Default: 4x VLA size
-        if pixel_budget is not None and pixel_budget > 0:
-            image = self._resize_with_pixel_budget(image, pixel_budget)
-        
-        visual_processed = processor.preprocess(image, return_tensors="pt")
-        image_tensor = visual_processed["pixel_values"]
-        if isinstance(image_tensor, list):
-            image_tensor = image_tensor[0]
-        
-        # The Qwen processor returns 2D vision features [num_patches, feature_dim]
-        # Keep them as-is since that's what the model expects
-            
-        grid_thw = visual_processed["image_grid_thw"][0]
-        return image_tensor, grid_thw
+    def process_video_from_frames(self, frame_paths):
+        """Process video from a list of frame image paths using the tested function from data_qwen.py."""
+        # Construct full paths
+        return self._qwen_dataset_helper.process_video_from_frames(frame_paths)
     
-    def _resize_with_pixel_budget(self, image, pixel_budget):
-        """Resize image to have at most pixel_budget pixels while preserving aspect ratio."""
-        width, height = image.size
-        current_pixels = width * height
-        
-        # If image already fits within pixel budget, return as is
-        if current_pixels <= pixel_budget:
-            return image
-        
-        # Calculate scaling factor based on pixel budget
-        # scale^2 * current_pixels = pixel_budget
-        scale_factor = math.sqrt(pixel_budget / current_pixels)
-        
-        # Qwen2-VL constraints: both dimensions must be > 28 (IMAGE_FACTOR) and divisible by 28
-        factor = 28
-        min_pixels_per_image = (factor + factor) * (factor + factor)  # 56*56 = 3136 pixels minimum
-        
-        # Helper function to round to nearest factor multiple (must be > factor, not >= factor)
-        def round_to_factor(value, factor):
-            result = round(value / factor) * factor
-            # Ensure result is strictly greater than factor
-            if result <= factor:
-                result = factor + factor  # Next valid multiple (56)
-            return result
-        
-        # Apply scale factor and round to factor multiples
-        scaled_width = width * scale_factor
-        scaled_height = height * scale_factor
-        new_width = round_to_factor(scaled_width, factor)
-        new_height = round_to_factor(scaled_height, factor)
-        
-        # Ensure minimum pixels per image (in case one dimension is very small)
-        current_pixels_after_resize = new_width * new_height
-        if current_pixels_after_resize < min_pixels_per_image:
-            # Scale up to meet minimum pixels while preserving aspect ratio
-            aspect_ratio = width / height
-            if aspect_ratio >= 1:  # Width >= Height
-                target_width = math.ceil(math.sqrt(min_pixels_per_image * aspect_ratio) / factor) * factor
-                if target_width <= factor:
-                    target_width = factor + factor
-                target_height = round_to_factor(target_width / aspect_ratio, factor)
-            else:  # Height > Width
-                target_height = math.ceil(math.sqrt(min_pixels_per_image / aspect_ratio) / factor) * factor
-                if target_height <= factor:
-                    target_height = factor + factor
-                target_width = round_to_factor(target_height * aspect_ratio, factor)
-            new_width = target_width
-            new_height = target_height
-        
-        # If we still exceed pixel budget after minimum constraints, we need to accept it
-        # (minimum constraints take precedence over pixel budget to avoid processing errors)
-        
-        # Resize image
-        return image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-    
-    def _process_video_from_frames(self, frame_files, image_folder):
-        """Process video from a list of frame image paths using video-specific processing."""
-        if not isinstance(frame_files, list) or len(frame_files) <= 1:
-            raise ValueError("Expected multiple frame files for video processing")
-        
-        # Load frames
-        frames = []
-        for frame_file in frame_files:
-            frame_path = os.path.join(image_folder, frame_file)
-            if os.path.exists(frame_path):
-                # try:
-                img = Image.open(frame_path).convert("RGB")
-                frames.append(np.array(img))
-                # except Exception as e:
-                #     print(f"Failed to load frame {frame_path}: {e}")
-                #     continue
-        
-        if not frames:
-            raise ValueError("No frames could be loaded")
-        
-        # Convert to numpy array with shape (num_frames, height, width, channels)
-        video = np.stack(frames)
-        
-        # Determine frame sampling
-        total_frames = len(frames)
-        video_min_frames = getattr(self.data_args, "video_min_frames", 4)
-        video_max_frames = getattr(self.data_args, "video_max_frames", 8)
-        
-        # Sample frames if needed
-        if total_frames > video_max_frames:
-            frame_idx = np.linspace(0, total_frames - 1, video_max_frames, dtype=int)
-            frame_idx = np.unique(frame_idx)
-            video = video[frame_idx]
-        else:
-            frame_idx = np.arange(total_frames)
-        
-        # Assume 1 fps for frame sequences (can be adjusted)
-        video_length = len(frame_idx)
-        
-        return self._process_video_frames(video, frame_idx, video_length)
-    
-    def _process_video_frames(self, video, frame_idx, video_length):
-        """Process video frames using the video processor."""
-        fps = len(frame_idx) / video_length
-        processor = copy.deepcopy(self.data_args.image_processor)
-        
-        # Set video-specific processing parameters if available
-        if hasattr(self.data_args, 'video_max_frame_pixels'):
-            processor.max_pixels = self.data_args.video_max_frame_pixels
-        if hasattr(self.data_args, 'video_min_frame_pixels'):
-            processor.min_pixels = self.data_args.video_min_frame_pixels
-        
-        # Process video
-        video_processed = processor.preprocess(
-            images=None, 
-            videos=video, 
-            return_tensors="pt",
-            min_pixels=self.data_args.video_min_frame_pixels,
-            max_pixels=self.data_args.video_max_frame_pixels,
-        )
-        video_tensor = video_processed["pixel_values_videos"]
-        grid_thw = video_processed["video_grid_thw"]
-        
-        # Handle grid_thw format
-        if isinstance(grid_thw, list) and len(grid_thw) > 0:
-            grid_thw = grid_thw[0]
-        
-        # Ensure grid_thw has proper shape
-        if grid_thw.dim() == 1:
-            grid_thw = grid_thw.unsqueeze(0)
-        
-        return video_tensor, grid_thw
+    def process_video_frames(self, video, frame_idx, video_length):
+        """Process video frames using the tested function from data_qwen.py."""
+        return self._qwen_dataset_helper.process_video_frames(video, frame_idx, video_length)
     
     def __getitem__(self, idx):
         """Get a mixed training example - either VLA or JSON based on ratio."""
@@ -443,110 +479,195 @@ class MixedVLADataCollator:
     model_max_length: int = 2048
     
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        # Extract input_ids and labels, ensuring they are 1D tensors
-        input_ids = []
-        labels = []
-        
-        for instance in instances:
-            input_id = instance["input_ids"]
-            label = instance["labels"]
-            
-            # Ensure tensors are 1D
-            if input_id.dim() > 1:
-                input_id = input_id.squeeze()
-            if label.dim() > 1:
-                label = label.squeeze()
-                
-            input_ids.append(input_id)
-            labels.append(label)
-        
-        # Pad sequences
+        input_ids, labels, position_ids = tuple(
+            [instance[key] for instance in instances]
+            for key in ("input_ids", "labels", "position_ids")
+        )
+        input_ids = [ids.squeeze(0) for ids in input_ids]
+        labels = [ids.squeeze(0) for ids in labels]
         input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids,
-            batch_first=True,
-            padding_value=self.tokenizer.pad_token_id
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
         )
         labels = torch.nn.utils.rnn.pad_sequence(
-            labels,
-            batch_first=True,
-            padding_value=-100
+            labels, batch_first=True, padding_value=IGNORE_INDEX
         )
-        
-        # Create attention mask
-        attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
-        
-        batch = {
-            "input_ids": input_ids,
-            "labels": labels,
-            "attention_mask": attention_mask,
-        }
-        
-        # Handle images and videos - collect all pixel values and grid_thw
-        all_pixel_values = []
-        all_grid_thw = []
-        all_video_values = []
-        all_video_grid_thw = []
-        
-        for instance in instances:
-            # Handle image data (can coexist with video data)
-            if "pixel_values" in instance and instance["pixel_values"] is not None:
-                pixel_vals = instance["pixel_values"]
-                grid_thw = instance["image_grid_thw"]
-                
-                # Ensure grid_thw is 2D: [N, 3]
-                if grid_thw.dim() == 1:  # [3] -> [1, 3]
-                    grid_thw = grid_thw.unsqueeze(0)
-                elif grid_thw.dim() == 2:  # [N, 3] - already correct
-                    pass
-                else:
-                    print(f"Warning: Unexpected image grid_thw dimensions: {grid_thw.shape}")
-                    # Try to reshape to [N, 3]
-                    if grid_thw.numel() % 3 == 0:
-                        grid_thw = grid_thw.reshape(-1, 3)
-                    else:
-                        continue
-                
-                all_pixel_values.append(pixel_vals)
-                all_grid_thw.append(grid_thw)
-            
-            # Handle video data (can coexist with image data)
-            if "pixel_values_videos" in instance and instance["pixel_values_videos"] is not None:
-                video_vals = instance["pixel_values_videos"]
-                video_grid_thw = instance["video_grid_thw"]
-                
-                # Ensure video_grid_thw is 2D: [N, 3]
-                if video_grid_thw.dim() == 1:  # [3] -> [1, 3]
-                    video_grid_thw = video_grid_thw.unsqueeze(0)
-                elif video_grid_thw.dim() == 2:  # [N, 3] - already correct
-                    pass
-                else:
-                    print(f"Warning: Unexpected video grid_thw dimensions: {video_grid_thw.shape}")
-                    # Try to reshape to [N, 3]
-                    if video_grid_thw.numel() % 3 == 0:
-                        video_grid_thw = video_grid_thw.reshape(-1, 3)
-                    else:
-                        continue
-                
-                all_video_values.append(video_vals)
-                all_video_grid_thw.append(video_grid_thw)
-        
-        # Set image data
-        if all_pixel_values:
-            batch["pixel_values"] = torch.cat(all_pixel_values, dim=0)
-            batch["image_grid_thw"] = torch.cat(all_grid_thw, dim=0)
+        position_ids = pad_and_cat(position_ids)
+        input_ids = input_ids[:, : self.tokenizer.model_max_length]
+        labels = labels[:, : self.tokenizer.model_max_length]
+        position_ids = position_ids[:, : self.tokenizer.model_max_length]
+        batch = dict(
+            input_ids=input_ids,
+            labels=labels,
+            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+        )
+        images = list(
+            instance["pixel_values"]
+            for instance in instances
+            if "pixel_values" in instance
+        )
+        videos = list(
+            instance["pixel_values_videos"]
+            for instance in instances
+            if "pixel_values_videos" in instance
+        )
+        if len(images) != 0:
+            concat_images = torch.cat([image for image in images], dim=0)
+            grid_thw = [
+                instance["image_grid_thw"]
+                for instance in instances
+                if "image_grid_thw" in instance
+            ]
+            grid_thw = torch.cat(grid_thw, dim=0)
         else:
-            batch["pixel_values"] = None
-            batch["image_grid_thw"] = None
-        
-        # Set video data
-        if all_video_values:
-            batch["pixel_values_videos"] = torch.cat(all_video_values, dim=0)
-            batch["video_grid_thw"] = torch.cat(all_video_grid_thw, dim=0)
+            concat_images = None
+            grid_thw = None
+
+        if len(videos) != 0:
+            concat_videos = torch.cat([video for video in videos], dim=0)
+            video_grid_thw = [
+                instance["video_grid_thw"]
+                for instance in instances
+                if "video_grid_thw" in instance
+            ]
+            video_grid_thw = torch.cat(video_grid_thw, dim=0)
         else:
-            batch["pixel_values_videos"] = None
-            batch["video_grid_thw"] = None
-        
+            concat_videos = None
+            video_grid_thw = None
+
+        batch["pixel_values"] = concat_images
+        batch["image_grid_thw"] = grid_thw
+        batch["pixel_values_videos"] = concat_videos
+        batch["video_grid_thw"] = video_grid_thw
+        batch["position_ids"] = position_ids
         return batch
+
+        # # Extract input_ids, labels, and position_ids, ensuring they are proper tensors
+        # input_ids = []
+        # labels = []
+        # position_ids = []
+        # has_position_ids = "position_ids" in instances[0]
+        
+        # for instance in instances:
+        #     input_id = instance["input_ids"]
+        #     label = instance["labels"]
+            
+        #     # Ensure tensors are 1D
+        #     if input_id.dim() > 1:
+        #         input_id = input_id.squeeze()
+        #     if label.dim() > 1:
+        #         label = label.squeeze()
+                
+        #     input_ids.append(input_id)
+        #     labels.append(label)
+            
+        #     # Handle position_ids if present
+        #     if has_position_ids:
+        #         pos_id = instance.get("position_ids")
+        #         if pos_id is not None:
+        #             position_ids.append(pos_id)
+        
+        # # Pad sequences
+        # input_ids = torch.nn.utils.rnn.pad_sequence(
+        #     input_ids,
+        #     batch_first=True,
+        #     padding_value=self.tokenizer.pad_token_id
+        # )
+        # labels = torch.nn.utils.rnn.pad_sequence(
+        #     labels,
+        #     batch_first=True,
+        #     padding_value=-100
+        # )
+        
+        # # Create attention mask
+        # attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
+        
+        # batch = {
+        #     "input_ids": input_ids,
+        #     "labels": labels,
+        #     "attention_mask": attention_mask,
+        # }
+        
+        # # Handle position_ids if present
+        # if has_position_ids and position_ids:
+        #     # Use pad_and_cat from data_qwen.py for proper position_ids padding
+        #     position_ids = pad_and_cat(position_ids)
+        #     # Ensure position_ids matches the sequence length of input_ids
+        #     seq_len = input_ids.shape[1]
+        #     if position_ids.shape[2] > seq_len:
+        #         # Truncate to match input_ids sequence length
+        #         position_ids = position_ids[:, :, :seq_len]
+        #     elif position_ids.shape[2] < seq_len:
+        #         # Pad to match input_ids sequence length
+        #         pad_size = seq_len - position_ids.shape[2]
+        #         position_ids = torch.nn.functional.pad(position_ids, (0, pad_size), "constant", 1)
+        #     batch["position_ids"] = position_ids
+        
+        # # Handle images and videos - collect all pixel values and grid_thw
+        # all_pixel_values = []
+        # all_grid_thw = []
+        # all_video_values = []
+        # all_video_grid_thw = []
+        
+        # for instance in instances:
+        #     # Handle image data (can coexist with video data)
+        #     if "pixel_values" in instance and instance["pixel_values"] is not None:
+        #         pixel_vals = instance["pixel_values"]
+        #         grid_thw = instance["image_grid_thw"]
+                
+        #         # Ensure grid_thw is 2D: [N, 3]
+        #         if grid_thw.dim() == 1:  # [3] -> [1, 3]
+        #             grid_thw = grid_thw.unsqueeze(0)
+        #         elif grid_thw.dim() == 2:  # [N, 3] - already correct
+        #             pass
+        #         else:
+        #             print(f"Warning: Unexpected image grid_thw dimensions: {grid_thw.shape}")
+        #             # Try to reshape to [N, 3]
+        #             if grid_thw.numel() % 3 == 0:
+        #                 grid_thw = grid_thw.reshape(-1, 3)
+        #             else:
+        #                 continue
+                
+        #         all_pixel_values.append(pixel_vals)
+        #         all_grid_thw.append(grid_thw)
+            
+        #     # Handle video data (can coexist with image data)
+        #     if "pixel_values_videos" in instance and instance["pixel_values_videos"] is not None:
+        #         video_vals = instance["pixel_values_videos"]
+        #         video_grid_thw = instance["video_grid_thw"]
+                
+        #         # Ensure video_grid_thw is 2D: [N, 3]
+        #         if video_grid_thw.dim() == 1:  # [3] -> [1, 3]
+        #             video_grid_thw = video_grid_thw.unsqueeze(0)
+        #         elif video_grid_thw.dim() == 2:  # [N, 3] - already correct
+        #             pass
+        #         else:
+        #             print(f"Warning: Unexpected video grid_thw dimensions: {video_grid_thw.shape}")
+        #             # Try to reshape to [N, 3]
+        #             if video_grid_thw.numel() % 3 == 0:
+        #                 video_grid_thw = video_grid_thw.reshape(-1, 3)
+        #             else:
+        #                 continue
+                
+        #         all_video_values.append(video_vals)
+        #         all_video_grid_thw.append(video_grid_thw)
+        
+        # # Set image data
+        # if all_pixel_values:
+        #     batch["pixel_values"] = torch.cat(all_pixel_values, dim=0)
+        #     batch["image_grid_thw"] = torch.cat(all_grid_thw, dim=0)
+        # else:
+        #     batch["pixel_values"] = None
+        #     batch["image_grid_thw"] = None
+        
+        # # Set video data
+        # if all_video_values:
+        #     batch["pixel_values_videos"] = torch.cat(all_video_values, dim=0)
+        #     batch["video_grid_thw"] = torch.cat(all_video_grid_thw, dim=0)
+        # else:
+        #     batch["pixel_values_videos"] = None
+        #     batch["video_grid_thw"] = None
+        
+        # return batch
 
 
 def make_mixed_vla_data_module(

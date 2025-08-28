@@ -22,6 +22,9 @@ project_root = Path(__file__).parent.parent.parent.parent
 sys.path.append(str(project_root))
 from droid_rlds_dataset import DroidRldsDataset, DroidActionSpace
 
+# Import rope position embedding functions
+from .rope2d import get_rope_index_25, get_rope_index_2
+
 
 # TODO: action normalization
 # TODO: input state with binning
@@ -94,6 +97,12 @@ class DroidVLADataset(Dataset):
         
         # Get action vocabulary size from the tokenizer
         self.action_vocab_size = self.action_tokenizer.vocab_size
+        
+        # Set up rope index function based on model type
+        if hasattr(data_args, 'model_type') and data_args.model_type == "qwen2.5vl":
+            self.get_rope_index = get_rope_index_25
+        else:
+            self.get_rope_index = get_rope_index_2
         
         rank0_print(f"Initialized DROID VLA dataset with action vocab size: {self.action_vocab_size}")
         
@@ -256,11 +265,27 @@ class DroidVLADataset(Dataset):
             + [self.tokenizer.eos_token_id]
         )
         
+        # Calculate position_ids using rope position embedding
+        input_ids_tensor = torch.tensor(final_input_ids, dtype=torch.long).unsqueeze(0)  # Add batch dimension
+        image_grid_thw = image_inputs.get("image_grid_thw", torch.tensor([[1, 1, 1], [1, 1, 1]]))
+        
+        position_ids, _ = self.get_rope_index(
+            self.image_processor.merge_size,
+            input_ids_tensor,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=None,
+            second_per_grid_ts=None,
+        )
+        
+        # Remove batch dimension from position_ids to match other tensors
+        position_ids = position_ids.squeeze(1) if position_ids.dim() > 3 else position_ids
+        
         return {
             "input_ids": torch.tensor(final_input_ids, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
+            "position_ids": position_ids,
             "pixel_values": image_inputs.pixel_values,
-            "image_grid_thw": image_inputs.get("image_grid_thw", torch.tensor([[1, 1, 1], [1, 1, 1]])),
+            "image_grid_thw": image_grid_thw,
         }
 
 
@@ -274,6 +299,7 @@ class DroidDataCollator:
         # Extract all fields
         input_ids = [instance["input_ids"] for instance in instances]
         labels = [instance["labels"] for instance in instances]
+        position_ids = [instance["position_ids"] for instance in instances]
         
         # Pad sequences
         input_ids = torch.nn.utils.rnn.pad_sequence(
@@ -287,6 +313,24 @@ class DroidDataCollator:
             padding_value=-100
         )
         
+        # Handle position_ids padding using the same approach as mixed VLA dataset
+        from .data_qwen import pad_and_cat
+        position_ids = pad_and_cat(position_ids)
+
+        input_ids = input_ids[:, : self.tokenizer.model_max_length]
+        labels = labels[:, : self.tokenizer.model_max_length]
+        position_ids = position_ids[:, : self.tokenizer.model_max_length]
+        
+        # # Ensure position_ids matches the sequence length of input_ids
+        # seq_len = input_ids.shape[1]
+        # if position_ids.shape[2] > seq_len:
+        #     # Truncate to match input_ids sequence length
+        #     position_ids = position_ids[:, :, :seq_len]
+        # elif position_ids.shape[2] < seq_len:
+        #     # Pad to match input_ids sequence length
+        #     pad_size = seq_len - position_ids.shape[2]
+        #     position_ids = torch.nn.functional.pad(position_ids, (0, pad_size), "constant", 1)
+        
         # Concatenate pixel values and image_grid_thw for multi-image input
         pixel_values = torch.cat([instance["pixel_values"] for instance in instances], dim=0)
         image_grid_thw = torch.cat([torch.as_tensor(instance["image_grid_thw"]) for instance in instances], dim=0)
@@ -297,6 +341,7 @@ class DroidDataCollator:
         return {
             "input_ids": input_ids,
             "labels": labels,
+            "position_ids": position_ids,
             "attention_mask": attention_mask,
             "pixel_values": pixel_values,
             "image_grid_thw": image_grid_thw,

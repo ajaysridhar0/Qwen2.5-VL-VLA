@@ -162,7 +162,6 @@ def get_rope_index_25(
 
                 range_tensor = torch.arange(llm_grid_t).view(-1, 1)
                 expanded_range = range_tensor.expand(-1, llm_grid_h * llm_grid_w)
-
                 time_tensor = expanded_range * second_per_grid_t * 2
 
                 time_tensor_long = time_tensor.long()

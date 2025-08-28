@@ -105,6 +105,10 @@ class VLADataArguments(DataArguments):
     image_height: int = field(default=180, metadata={"help": "Height to resize images to"})
     image_width: int = field(default=320, metadata={"help": "Width to resize images to"})
     
+    # Image resize constraints for JSON data
+    max_image_dim: int = field(default=320, metadata={"help": "Maximum dimension (width or height) for resizing images"})
+    min_image_dim: int = field(default=28, metadata={"help": "Minimum dimension (width or height) after resizing images"})
+    
     # Co-training with regular JSON data to prevent catastrophic forgetting
     enable_cotrain: bool = field(default=False, metadata={"help": "Enable co-training with regular JSON data"})
     cotrain_json_paths: str = field(default="", metadata={"help": "Comma-separated paths to JSON/JSONL files for co-training"})
@@ -141,6 +145,14 @@ class VLATrainingArguments(TrainingArguments):
     log_generations_to_wandb: bool = field(
         default=True,
         metadata={"help": "Whether to log generation examples to wandb."}
+    )
+    gradient_checkpointing_kwargs: dict = field(
+        default_factory=lambda: {"use_reentrant": False},
+        metadata={"help": "Keyword arguments for gradient checkpointing, e.g., `{'use_reentrant': False}` for compatibility with Deepspeed."}
+    )
+    ddp_find_unused_parameters: bool = field(
+        default=False,
+        metadata={"help": "When using distributed training, you may need to set this to True if you use gradient checkpointing."}
     )
 
 
@@ -322,6 +334,7 @@ def train(attn_implementation="flash_attention_2"):
         rank0_print(f"Co-training enabled with {len(json_paths)} JSON datasets")
         rank0_print(f"JSON ratio: {data_args.cotrain_json_ratio:.2f}")
         rank0_print(f"JSON paths: {json_paths}")
+        rank0_print(f"Image resize constraints: max_dim={data_args.max_image_dim}, min_dim={data_args.min_image_dim}")
         rank0_print(f"Pixel budget: {data_args.pixel_budget:,} pixels per JSON query (VLA data unchanged)")
         
         data_module = make_mixed_vla_data_module(
@@ -337,6 +350,7 @@ def train(attn_implementation="flash_attention_2"):
     else:
         # Standard VLA-only training
         rank0_print("VLA-only training (no co-training)")
+        rank0_print(f"Image resize constraints: max_dim={data_args.max_image_dim}, min_dim={data_args.min_image_dim}")
         rank0_print(f"Pixel budget: {data_args.pixel_budget:,} pixels per JSON query (VLA data unchanged)")
         data_module = make_droid_data_module(
             tokenizer=tokenizer, 

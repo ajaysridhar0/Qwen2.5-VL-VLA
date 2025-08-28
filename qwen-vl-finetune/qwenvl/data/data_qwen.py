@@ -49,6 +49,7 @@ def preprocess_qwen_2_visual(
     tokenizer: transformers.PreTrainedTokenizer,
     grid_thw_image: List = [],
     grid_thw_video: List = [],
+    max_length: Optional[int] = None,
 ) -> Dict:
     roles = {"human": "user", "gpt": "assistant", "system": "system"}
     default_system_message = "You are a helpful assistant."
@@ -147,6 +148,12 @@ def preprocess_qwen_2_visual(
                 target += target_mask
 
         assert len(input_id) == len(target), f"{len(input_id)} != {len(target)}"
+        
+        # Apply truncation if max_length is specified
+        if max_length is not None and len(input_id) > max_length:
+            input_id = input_id[:max_length]
+            target = target[:max_length]
+        
         input_ids.append(input_id)
         targets.append(target)
 
@@ -491,6 +498,7 @@ class LazySupervisedDataset(Dataset):
             self.tokenizer,
             grid_thw_image=grid_thw_merged if grid_thw_merged else None,
             grid_thw_video=video_grid_thw_merged if video_grid_thw_merged else None,
+            max_length=getattr(self.tokenizer, 'model_max_length', None),
         )
         position_ids, _ = self.get_rope_index(
             self.data_args.image_processor.merge_size,
@@ -505,7 +513,7 @@ class LazySupervisedDataset(Dataset):
             grid_thw_merged = None
             sources = copy.deepcopy([e["conversations"] for e in sources])
             data_dict = preprocess_qwen_2_visual(
-                sources, self.tokenizer, grid_thw=grid_thw_merged
+                sources, self.tokenizer, grid_thw_image=grid_thw_merged, max_length=getattr(self.tokenizer, 'model_max_length', None)
             )
             position_ids = (
                 torch.arange(0, data_dict["input_ids"].size(1))
