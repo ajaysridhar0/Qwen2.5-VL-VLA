@@ -14,6 +14,8 @@ from torch.utils.data import Dataset, DataLoader
 from dataclasses import dataclass
 from typing import Dict, Sequence, List, Optional, Any, Union
 from PIL import Image
+from decord import VideoReader
+from torchcodec.decoders import VideoDecoder
 import os
 
 # Import existing components
@@ -149,15 +151,50 @@ class MixedVLADataset(Dataset):
         
         # Initialize regular JSON dataset if co-training is enabled
         self.json_dataset = None
+        self.json_datasets = []  # List of individual datasets
+        self.json_dataset_weights = []  # Weights for each dataset
+        self.json_dataset_sizes = []  # Sizes of each dataset
         if hasattr(data_args, 'cotrain_json_paths') and data_args.cotrain_json_paths:
-            self.json_dataset = self._load_json_dataset()
+            self.json_dataset, self.json_datasets, self.json_dataset_weights, self.json_dataset_sizes = self._load_json_dataset()
             rank0_print(f"Loaded {len(self.json_dataset)} JSON conversation examples for co-training")
+            if len(self.json_datasets) > 1:
+                rank0_print(f"Individual JSON datasets: {len(self.json_datasets)} datasets")
+                for i, (size, weight) in enumerate(zip(self.json_dataset_sizes, self.json_dataset_weights)):
+                    rank0_print(f"  Dataset {i}: {size} samples, weight={weight:.3f}")
         
         # Calculate effective dataset size and sampling ratios
-        self.vla_ratio = 1.0 - self.cotrain_json_ratio
+        self.vla_size = len(self.vla_dataset)
+        
+        # Handle count-based weighting that includes VLA dataset
+        if hasattr(data_args, 'weight_by_count') and data_args.weight_by_count and self.json_dataset:
+            rank0_print("Using count-based weighting for all datasets (including VLA)")
+            
+            # Calculate weights for all datasets including VLA
+            power = getattr(data_args, 'count_weight_power', 1.0)
+            all_sizes = [self.vla_size] + self.json_dataset_sizes
+            all_weights = [size ** power for size in all_sizes]
+            total_weight = sum(all_weights)
+            
+            if total_weight > 0:
+                all_weights = [w / total_weight for w in all_weights]
+                self.vla_ratio = all_weights[0]
+                self.cotrain_json_ratio = 1.0 - self.vla_ratio
+                
+                # Update individual JSON weights to be proportional within the JSON portion
+                json_total_weight = sum(all_weights[1:])
+                if json_total_weight > 0:
+                    self.json_dataset_weights = [w / json_total_weight * self.cotrain_json_ratio for w in all_weights[1:]]
+                
+                rank0_print(f"Count-based weights (power={power}):")
+                rank0_print(f"  VLA: {self.vla_ratio:.3f} (size={self.vla_size})")
+                for i, (size, weight) in enumerate(zip(self.json_dataset_sizes, self.json_dataset_weights)):
+                    rank0_print(f"  JSON-{i}: {weight:.3f} (size={size})")
+            else:
+                self.vla_ratio = 1.0 - self.cotrain_json_ratio
+        else:
+            self.vla_ratio = 1.0 - self.cotrain_json_ratio
         
         # Determine total dataset size based on VLA dataset size
-        self.vla_size = len(self.vla_dataset)
         if self.json_dataset:
             # Calculate how many JSON examples we need based on the ratio
             self.json_size = len(self.json_dataset)
@@ -179,17 +216,41 @@ class MixedVLADataset(Dataset):
             rank0_print(f"VLA-only dataset: {self.vla_size} examples")
     
     def _load_json_dataset(self):
-        """Load and prepare JSON conversational data."""
+        """Load and prepare JSON conversational data with individual weighting support."""
         json_data = []
+        individual_datasets = []
+        individual_sizes = []
         
         # Handle multiple JSON file paths
         json_paths = self.data_args.cotrain_json_paths
         if isinstance(json_paths, str):
             json_paths = [json_paths]
         
-        for json_path in json_paths:
+        # Parse individual weights if provided
+        individual_weights = []
+        if hasattr(self.data_args, 'cotrain_json_weights') and self.data_args.cotrain_json_weights:
+            weight_strs = [w.strip() for w in self.data_args.cotrain_json_weights.split(",") if w.strip()]
+            if len(weight_strs) != len(json_paths):
+                rank0_print(f"Warning: Number of weights ({len(weight_strs)}) doesn't match number of JSON paths ({len(json_paths)}). Using equal weights.")
+                individual_weights = [1.0] * len(json_paths)
+            else:
+                try:
+                    individual_weights = [float(w) for w in weight_strs]
+                    if any(w < 0 for w in individual_weights):
+                        raise ValueError("Weights must be non-negative")
+                except ValueError as e:
+                    rank0_print(f"Warning: Invalid weight values: {e}. Using equal weights.")
+                    individual_weights = [1.0] * len(json_paths)
+        else:
+            # Use equal weights if none provided
+            individual_weights = [1.0] * len(json_paths)
+        
+        # Load each dataset individually
+        for i, json_path in enumerate(json_paths):
             if not os.path.exists(json_path):
                 rank0_print(f"Warning: JSON file not found: {json_path}")
+                individual_datasets.append([])
+                individual_sizes.append(0)
                 continue
                 
             # Load JSON or JSONL data
@@ -200,15 +261,38 @@ class MixedVLADataset(Dataset):
                 with open(json_path, 'r') as f:
                     data = json.load(f)
             
-            # Add data path information
+            # Add data path information and dataset index
             for item in data:
                 if 'data_path' not in item:
                     item['data_path'] = os.path.dirname(json_path)
+                item['dataset_index'] = i  # Track which dataset this sample comes from
             
+            individual_datasets.append(data)
+            individual_sizes.append(len(data))
             json_data.extend(data)
             rank0_print(f"Loaded {len(data)} examples from {json_path}")
         
-        return json_data
+        # Handle count-based weighting if enabled
+        if hasattr(self.data_args, 'weight_by_count') and self.data_args.weight_by_count:
+            rank0_print("Using count-based weighting for JSON datasets")
+            # Calculate weights based on dataset sizes
+            power = getattr(self.data_args, 'count_weight_power', 1.0)
+            size_weights = [size ** power for size in individual_sizes]
+            total_weight = sum(size_weights)
+            if total_weight > 0:
+                individual_weights = [w / total_weight for w in size_weights]
+            else:
+                individual_weights = [1.0 / len(individual_datasets)] * len(individual_datasets)
+            rank0_print(f"Count-based weights (power={power}): {[f'{w:.3f}' for w in individual_weights]}")
+        else:
+            # Normalize individual weights
+            total_weight = sum(individual_weights)
+            if total_weight > 0:
+                individual_weights = [w / total_weight for w in individual_weights]
+            else:
+                individual_weights = [1.0 / len(individual_datasets)] * len(individual_datasets)
+        
+        return json_data, individual_datasets, individual_weights, individual_sizes
     
     def _create_qwen_helper(self, tokenizer, data_args):
         """Create a minimal helper object with just the image/video processing methods."""
@@ -251,6 +335,109 @@ class MixedVLADataset(Dataset):
                     image_tensor = image_tensor[0]
                 grid_thw = visual_processed["image_grid_thw"][0]
                 return image_tensor, grid_thw
+
+            def process_ego_npy(self, npy_file):
+                """
+                Reverses the ImageNet normalization on a NumPy array.
+
+                Args:
+                        image (np.ndarray): A NumPy array of shape (N, 3, 224, 224) 
+                                            representing a normalized image. It is 
+                                            assumed the input was normalized with the
+                                            standard ImageNet mean and std, and scaled to [0, 1].
+
+                Returns:
+                    np.ndarray: The unnormalized image as a NumPy array of shape
+                                (224, 224, 3) with pixel values in the [0, 255] range
+                                as uint8 type.
+                """
+                imgs = np.load(npy_file)
+                imgs = np.transpose(imgs, (0, 2, 3, 1))
+                assert imgs.shape[1:] == (224, 224, 3)
+
+                # ImageNet mean and standard deviation
+                mean = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 1, 3)
+                std = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 1, 3)
+
+                # Un-normalize: (image * std) + mean
+                unnormalized_images = (imgs * std) + mean
+                assert unnormalized_images.shape[1:] == (224, 224, 3)
+
+                # Rescale from [0, 1] to [0, 255]
+                unnormalized_images *= 255.0
+
+                # Clip values to ensure they are within the valid [0, 255] range
+                # and convert to an 8-bit unsigned integer, the standard for images.
+                video = np.clip(unnormalized_images, 0, 255).astype(np.uint8)
+                return self.process_video_frames(video, np.arange(len(video)), len(video))
+
+            def process_video(self, video_file):
+                # Check if video_file is a list of image frames
+                if isinstance(video_file, list) and all(".jpg" in f or ".png" in f for f in video_file):
+                    return self.process_video_from_frames(video_file)
+
+                if video_file.endswith(".npy"):
+                    return self.process_ego_npy(video_file)
+                
+                decord_video = None
+                decord_attempts = 0
+                max_decord_attempts = 3
+                while decord_attempts < max_decord_attempts:
+                    try:
+                        decord_video = self.video_decord(video_file)
+                        return decord_video
+                    except Exception as e:
+                        print(f"Decord attempt {decord_attempts + 1} failed: {e}")
+                        decord_attempts += 1
+
+                torchcodec_video = None
+                try:
+                    torchcodec_video = self.video_torchcodec(video_file)
+                    return torchcodec_video
+                except Exception as e:
+                    print(f"torchcodec attempt failed: {e}")
+
+            def video_decord(self, video_file):
+                if not os.path.exists(video_file):
+                    print(f"File not exist: {video_file}")
+                vr = VideoReader(video_file, num_threads=4)
+                total_frames = len(vr)
+                avg_fps = vr.get_avg_fps()
+                video_length = total_frames / avg_fps
+                interval = getattr(self.data_args, "base_interval", 4)
+
+                num_frames_to_sample = round(video_length / interval)
+                video_min_frames = getattr(self.data_args, "video_min_frames", 4)
+                video_max_frames = getattr(self.data_args, "video_max_frames", 8)
+
+                target_frames = min(
+                    max(num_frames_to_sample, video_min_frames), video_max_frames
+                )
+                frame_idx = np.linspace(0, total_frames - 1, target_frames, dtype=int)
+                frame_idx = np.unique(frame_idx)
+                video = vr.get_batch(frame_idx).asnumpy()
+                return self.process_video_frames(video, frame_idx, video_length)
+
+            def video_torchcodec(self, video_file):
+                device = "cpu"  # or e.g. "cuda"
+                decoder = VideoDecoder(video_file, device=device)
+                total_frames = decoder.metadata.num_frames
+                avg_fps = decoder.metadata.average_fps
+                video_length = total_frames / avg_fps
+                interval = getattr(self.data_args, "base_interval", 4)
+
+                num_frames_to_sample = round(video_length / interval)
+                video_min_frames = getattr(self.data_args, "video_min_frames", 4)
+                video_max_frames = getattr(self.data_args, "video_max_frames", 8)
+
+                target_frames = min(
+                    max(num_frames_to_sample, video_min_frames), video_max_frames
+                )
+                frame_idx = np.linspace(0, total_frames - 1, target_frames, dtype=int)
+                frame_idx = np.unique(frame_idx)
+                frame_batch = decoder.get_frames_at(indices=frame_idx.tolist())
+                video = frame_batch.data.cpu().numpy()
+                return self.process_video_frames(video, frame_idx, video_length)
             
             def process_video_from_frames(self, frame_paths):
                 """Process video from a list of frame image paths."""
@@ -323,13 +510,44 @@ class MixedVLADataset(Dataset):
         
         Supports mixed media: JSON items can contain both 'image' and 'video' fields.
         Images are processed as image data, videos are processed as video data.
+        
+        If individual JSON datasets are loaded, uses weighted sampling based on dataset weights.
         """
         if not self.json_dataset:
             raise ValueError("JSON dataset not loaded")
         
-        # Sample from JSON dataset with wraparound
-        json_idx = idx % len(self.json_dataset)
-        json_item = self.json_dataset[json_idx]
+        # Choose which JSON dataset to sample from based on weights
+        if len(self.json_datasets) > 1 and self.json_dataset_weights:
+            # Use weighted sampling to choose dataset
+            import random
+            # Create deterministic choice based on idx to ensure reproducibility
+            import hashlib
+            hash_input = f"json_dataset_{idx}".encode()
+            hash_value = int(hashlib.md5(hash_input).hexdigest()[:8], 16)
+            random_value = (hash_value % 1000000) / 1000000.0
+            
+            # Find which dataset to use based on cumulative weights
+            cumulative_weight = 0.0
+            dataset_index = 0
+            for i, weight in enumerate(self.json_dataset_weights):
+                cumulative_weight += weight
+                if random_value < cumulative_weight:
+                    dataset_index = i
+                    break
+            
+            # Sample from the chosen dataset
+            chosen_dataset = self.json_datasets[dataset_index]
+            if len(chosen_dataset) > 0:
+                json_idx = idx % len(chosen_dataset)
+                json_item = chosen_dataset[json_idx]
+            else:
+                # Fallback to combined dataset if chosen dataset is empty
+                json_idx = idx % len(self.json_dataset)
+                json_item = self.json_dataset[json_idx]
+        else:
+            # Sample from combined JSON dataset with wraparound
+            json_idx = idx % len(self.json_dataset)
+            json_item = self.json_dataset[json_idx]
         
         # Process the JSON item similar to LazySupervisedDataset
         sources = [json_item]
@@ -364,23 +582,46 @@ class MixedVLADataset(Dataset):
             ]
         if "video" in sources[0]:
             video_file = json_item["video"]
-            if not isinstance(video_file, List):
-                video_file = [video_file]
-            # else:
-                # if len(video_file) > 1:
-            results = [self.process_video_from_frames(video_file)]
-            video, video_grid_thw, second_per_grid_ts = zip(*results)
-                # else:
-                #     video_file = video_file[0]
-                #     video, video_grid_thw, second_per_grid_ts = self.process_video(
-                #         video_file
-                #     )
-                #     video = [video]
-            # else:
-            #     video, video_grid_thw, second_per_grid_ts = self.process_video(
-            #         video_file
-            #     )
-            #     video = [video]
+            # if not isinstance(video_file, List):
+            #     video_file = [video_file]
+            # if all(".jpg" in f or ".png" in f for f in video_file):
+            #     video_file = [video_file]
+            # # else:
+            #     # if len(video_file) > 1:
+            # results = [self.process_video(file) for file in video_file]
+            # video, video_grid_thw, second_per_grid_ts = zip(*results)
+            #     # else:
+            #     #     video_file = video_file[0]
+            #     #     video, video_grid_thw, second_per_grid_ts = self.process_video(
+            #     #         video_file
+            #     #     )
+            #     #     video = [video]
+            # # else:
+            # #     video, video_grid_thw, second_per_grid_ts = self.process_video(
+            # #         video_file
+            # #     )
+            # #     video = [video]
+
+            if isinstance(video_file, List):
+                if not isinstance(video_file, List):
+                    video_file = [video_file]
+                if all(".jpg" in f or ".png" in f for f in video_file):
+                    video_file = [video_file]
+                if len(video_file) > 1:
+                    results = [self.process_video(file) for file in video_file]
+                    video, video_grid_thw, second_per_grid_ts = zip(*results)
+                else:
+                    video_file = video_file[0]
+                    video, video_grid_thw, second_per_grid_ts = self.process_video(
+                        video_file
+                    )
+                    video = [video]
+            else:
+                video, video_grid_thw, second_per_grid_ts = self.process_video(
+                    video_file
+                )
+                video = [video]
+
             video_grid_thw_merged = copy.deepcopy(video_grid_thw)
             if not isinstance(video_grid_thw, Sequence):
                 video_grid_thw_merged = [video_grid_thw_merged]
@@ -403,7 +644,7 @@ class MixedVLADataset(Dataset):
             video_grid_thw=(
                 torch.stack(video_grid_thw, dim=0) if video_grid_thw else None
             ),
-            second_per_grid_ts=None,
+            second_per_grid_ts=second_per_grid_ts if second_per_grid_ts else None,
         )
         if "image" not in sources[0] and "video" not in sources[0]:
             grid_thw_merged = None
@@ -438,15 +679,15 @@ class MixedVLADataset(Dataset):
     def process_image_unified(self, image_file):
         """Process a single image file for JSON data using the tested function from data_qwen.py."""
         return self._qwen_dataset_helper.process_image_unified(image_file)
+
+    def process_video(self, video_file):
+        """Process a single video file for JSON data using the tested function from data_qwen.py."""
+        return self._qwen_dataset_helper.process_video(video_file)
     
-    def process_video_from_frames(self, frame_paths):
-        """Process video from a list of frame image paths using the tested function from data_qwen.py."""
-        # Construct full paths
-        return self._qwen_dataset_helper.process_video_from_frames(frame_paths)
-    
-    def process_video_frames(self, video, frame_idx, video_length):
-        """Process video frames using the tested function from data_qwen.py."""
-        return self._qwen_dataset_helper.process_video_frames(video, frame_idx, video_length)
+    # def process_video_from_frames(self, frame_paths):
+    #     """Process video from a list of frame image paths using the tested function from data_qwen.py."""
+    #     # Construct full paths
+    #     return self._qwen_dataset_helper.process_video_from_frames(frame_paths)
     
     def __getitem__(self, idx):
         """Get a mixed training example - either VLA or JSON based on ratio."""
@@ -709,6 +950,7 @@ def make_mixed_vla_data_module(
     eval_dataset = None
     if create_eval_dataset:
         eval_size = 100  # Fixed 100 samples for eval
+        eval_cotrain_json_ratio = 0.5 if 0.0 < cotrain_json_ratio < 1.0 else cotrain_json_ratio
         
         eval_dataset = MixedVLADataset(
             tokenizer=tokenizer,
@@ -717,7 +959,7 @@ def make_mixed_vla_data_module(
             model_max_length=model_max_length,
             token_mappings=token_mappings,
             image_size=image_size,
-            cotrain_json_ratio=cotrain_json_ratio,
+            cotrain_json_ratio=eval_cotrain_json_ratio,
         )
         
         # Override length and total_size for eval dataset
@@ -729,7 +971,7 @@ def make_mixed_vla_data_module(
             if train_dataset.vla_ratio == 0.0:
                 print(f"Eval dataset configured: JSON-only={eval_size}")
             else:
-                print(f"Eval dataset configured: Mixed={eval_size} (VLA ratio={train_dataset.vla_ratio:.2f}, JSON ratio={train_dataset.cotrain_json_ratio:.2f})")
+                print(f"Eval dataset configured: Mixed={eval_size} (VLA ratio={1-eval_cotrain_json_ratio:.2f}, JSON ratio={eval_cotrain_json_ratio:.2f})")
         else:
             print(f"Eval dataset configured: VLA-only={eval_size}")
     

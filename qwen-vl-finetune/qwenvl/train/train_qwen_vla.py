@@ -7,6 +7,7 @@ import os
 import logging
 import pathlib
 import torch
+import torch.nn
 import transformers
 import json
 from typing import Dict, List, Optional
@@ -84,6 +85,12 @@ class VLATrainer(Trainer):
     def __init__(self, *args, train_sampler_params=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.train_sampler_params = train_sampler_params
+        # Initialize metrics for separate loss tracking
+        self._droid_loss_sum = 0.0
+        self._droid_loss_count = 0
+        self._json_loss_sum = 0.0
+        self._json_loss_count = 0
+        self._log_interval = self.args.logging_steps  # Sync with Trainer's logging steps
     
     def _get_train_sampler(self):
         """Override to use our custom fixed ratio sampler if params are provided."""
@@ -109,10 +116,139 @@ class VLATrainer(Trainer):
             rank0_print(f"  JSON samples per batch: {sampler.json_per_batch}")
             rank0_print(f"  VLA samples per batch: {sampler.vla_per_batch}")
             
+            # Calculate and show the actual achieved ratio
+            if sampler.json_per_batch == 0 and hasattr(sampler, 'batches_per_json_cycle'):
+                if sampler.batches_per_json_cycle != float('inf'):
+                    achieved_ratio = 1.0 / (sampler.batches_per_json_cycle * self.args.per_device_train_batch_size)
+                    rank0_print(f"  Batches per JSON cycle: {sampler.batches_per_json_cycle}")
+                    rank0_print(f"  Actual achieved ratio: {achieved_ratio:.4f}")
+                    ratio_error = abs(achieved_ratio - json_ratio) / json_ratio * 100
+                    rank0_print(f"  Ratio error: {ratio_error:.1f}%")
+                else:
+                    rank0_print(f"  No JSON samples (ratio too small)")
+            else:
+                achieved_ratio = sampler.json_per_batch / self.args.per_device_train_batch_size
+                rank0_print(f"  Actual achieved ratio: {achieved_ratio:.4f}")
+                if json_ratio > 0:
+                    ratio_error = abs(achieved_ratio - json_ratio) / json_ratio * 100
+                    rank0_print(f"  Ratio error: {ratio_error:.1f}%")
+            
             return sampler
         else:
             # Use default sampler
             return super()._get_train_sampler()
+    
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """
+        Override compute_loss to track separate losses for droid and JSON data.
+        
+        We identify data types by checking for action tokens in the input_ids.
+        """
+        # Get the base loss from parent class
+        outputs = model(**inputs)
+        loss = outputs.loss if isinstance(outputs, dict) else outputs[0]
+        
+        # Check if we have action tokens to identify droid data
+        if hasattr(self, 'action_start_id') and self.action_start_id is not None:
+            # Get input_ids from the batch
+            input_ids = inputs.get("input_ids", None)
+            
+            if input_ids is not None:
+                # Check each sample in the batch
+                batch_size = input_ids.shape[0]
+                
+                # Compute per-sample loss if not already done
+                if batch_size > 1:
+                    # We need to compute per-sample loss to track separately
+                    labels = inputs.get("labels", None)
+                    if labels is not None:
+                        # Get logits and shift for loss computation
+                        logits = outputs.logits
+                        shift_logits = logits[..., :-1, :].contiguous()
+                        shift_labels = labels[..., 1:].contiguous()
+                        
+                        # Compute per-sample loss
+                        loss_fct = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
+                        per_token_loss = loss_fct(
+                            shift_logits.view(-1, shift_logits.size(-1)),
+                            shift_labels.view(-1)
+                        )
+                        
+                        # Reshape back to [batch_size, seq_len-1]
+                        per_token_loss = per_token_loss.view(batch_size, -1)
+                        
+                        # Average over valid tokens for each sample
+                        valid_tokens = (shift_labels != -100).float()
+                        per_sample_loss = (per_token_loss * valid_tokens).sum(dim=1) / valid_tokens.sum(dim=1).clamp(min=1)
+                        
+                        # Track losses based on data type
+                        for i in range(batch_size):
+                            sample_loss = per_sample_loss[i].item()
+                            # Check if this sample has action tokens (droid data)
+                            has_action_tokens = (input_ids[i] == self.action_start_id).any().item()
+                            
+                            if has_action_tokens:
+                                self._droid_loss_sum += sample_loss
+                                self._droid_loss_count += 1
+                            else:
+                                self._json_loss_sum += sample_loss
+                                self._json_loss_count += 1
+                else:
+                    # Single sample in batch
+                    loss_value = loss.item() if torch.is_tensor(loss) else loss
+                    has_action_tokens = (input_ids[0] == self.action_start_id).any().item()
+                    
+                    if has_action_tokens:
+                        self._droid_loss_sum += loss_value
+                        self._droid_loss_count += 1
+                    else:
+                        self._json_loss_sum += loss_value
+                        self._json_loss_count += 1
+        
+        # Log separate losses periodically
+        if self.state.global_step > 0 and self.state.global_step % self._log_interval == 0:
+            self._log_separate_losses()
+        
+        return (loss, outputs) if return_outputs else loss
+    
+    def _log_separate_losses(self):
+        """Log separate losses to wandb and console."""
+        metrics = {}
+        
+        # Calculate average droid loss
+        if self._droid_loss_count > 0:
+            avg_droid_loss = self._droid_loss_sum / self._droid_loss_count
+            metrics["train/droid_loss"] = avg_droid_loss
+            # Reset counters
+            self._droid_loss_sum = 0.0
+            self._droid_loss_count = 0
+        
+        # Calculate average JSON loss
+        if self._json_loss_count > 0:
+            avg_json_loss = self._json_loss_sum / self._json_loss_count
+            metrics["train/json_loss"] = avg_json_loss
+            # Reset counters
+            self._json_loss_sum = 0.0
+            self._json_loss_count = 0
+        
+        # Log to wandb if available
+        if len(metrics) > 0:
+            self.log(metrics)
+            
+            # Also print to console
+            if self.args.local_rank in [-1, 0]:
+                log_str = f"Step {self.state.global_step}: "
+                if "train/droid_loss" in metrics:
+                    log_str += f"droid_loss={metrics['train/droid_loss']:.4f} "
+                if "train/json_loss" in metrics:
+                    log_str += f"json_loss={metrics['train/json_loss']:.4f}"
+                rank0_print(log_str)
+    
+    def on_train_end(self, args, state, control, **kwargs):
+        """Log any remaining losses at the end of training."""
+        if self._droid_loss_count > 0 or self._json_loss_count > 0:
+            self._log_separate_losses()
+        return super().on_train_end(args, state, control, **kwargs)
 
 
 @dataclass
@@ -144,6 +280,11 @@ class VLADataArguments(DataArguments):
     use_fixed_ratio_sampler: bool = field(default=True, metadata={"help": "Use fixed ratio sampler to ensure consistent memory usage per batch"})
     pixel_budget: int = field(default=230400, metadata={"help": "Max pixels per JSON query (default: 230400 = 4x VLA size). For multi-frame JSON, budget applies to total pixels across all frames."})
     
+    # Individual dataset weighting options
+    cotrain_json_weights: str = field(default="", metadata={"help": "Comma-separated weights for individual JSON datasets (must match number of JSON paths). If empty, uses equal weights."})
+    weight_by_count: bool = field(default=False, metadata={"help": "Weight all datasets (including droid) by their sample count instead of using fixed ratios"})
+    count_weight_power: float = field(default=1.0, metadata={"help": "Power to raise dataset counts to when using count-based weighting (e.g., 0.5 for square root, 1.0 for linear)"})
+    
 
 
 
@@ -173,6 +314,10 @@ class VLATrainingArguments(TrainingArguments):
     log_generations_to_wandb: bool = field(
         default=True,
         metadata={"help": "Whether to log generation examples to wandb."}
+    )
+    eval_on_start: bool = field(
+        default=False,
+        metadata={"help": "Whether to run evaluation at the beginning of training (step 0)."}
     )
     gradient_checkpointing_kwargs: dict = field(
         default_factory=lambda: {"use_reentrant": False},
@@ -395,6 +540,7 @@ def train(attn_implementation="flash_attention_2"):
     action_data = np.random.rand(10, data_args.action_chunk_size, 8)    # one batch of action chunks
     _ = action_tokenizer(action_data)
     
+    rank0_print(f"Creating GenerationLoggingCallback with eval_on_start={training_args.eval_on_start}")
     generation_callback = GenerationLoggingCallback(
         tokenizer=tokenizer,
         action_tokenizer=action_tokenizer,
@@ -402,6 +548,7 @@ def train(attn_implementation="flash_attention_2"):
         num_examples=training_args.num_generation_examples,
         log_file="generations.txt",
         log_to_wandb=training_args.log_generations_to_wandb,
+        eval_on_start=training_args.eval_on_start,
     )
     
     # Create checkpoint processor callback to save preprocessor config with each checkpoint
@@ -420,6 +567,9 @@ def train(attn_implementation="flash_attention_2"):
         **data_module
     )
     
+    # Set action_start_id on trainer for loss separation
+    trainer.action_start_id = token_mappings['action_start_id']
+    
     # Set up the callback with trainer components
     generation_callback.setup_trainer_components(
         model=model,
@@ -431,10 +581,83 @@ def train(attn_implementation="flash_attention_2"):
     # trainer = trainer_class(model=model, processing_class=tokenizer, args=training_args, **data_module)
 
     # Start training
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        logging.info("checkpoint found, resume training")
-        trainer.train(resume_from_checkpoint=True)
+    checkpoint_dirs = list(pathlib.Path(training_args.output_dir).glob("checkpoint-*"))
+    if checkpoint_dirs:
+        # Filter out fixed checkpoints and get the latest checkpoint
+        regular_checkpoints = [d for d in checkpoint_dirs if not d.name.endswith('_fixed')]
+        if not regular_checkpoints:
+            rank0_print("ERROR: No regular checkpoints found, only fixed ones")
+            trainer.train()
+            return
+        
+        # Get the latest regular checkpoint
+        latest_checkpoint = max(regular_checkpoints, key=lambda x: int(x.name.split('-')[1]))
+        rank0_print(f"=== CHECKPOINT LOADING ===")
+        rank0_print(f"Found checkpoint: {latest_checkpoint}")
+        
+        # Verify checkpoint integrity
+        global_step_dir = latest_checkpoint / "global_step*"
+        global_step_dirs = list(latest_checkpoint.glob("global_step*"))
+        trainer_state_file = latest_checkpoint / "trainer_state.json"
+        
+        if not global_step_dirs:
+            rank0_print(f"WARNING: No global_step directory found in {latest_checkpoint}")
+        else:
+            rank0_print(f"Global step directory: {global_step_dirs[0]}")
+            
+        if not trainer_state_file.exists():
+            rank0_print(f"WARNING: No trainer_state.json found in {latest_checkpoint}")
+        else:
+            # Read and verify trainer state
+            with open(trainer_state_file, 'r') as f:
+                trainer_state = json.load(f)
+                rank0_print(f"Trainer state global_step: {trainer_state.get('global_step', 'UNKNOWN')}")
+                rank0_print(f"Trainer state epoch: {trainer_state.get('epoch', 'UNKNOWN')}")
+        
+        # Try to resume with full state first
+        try:
+            rank0_print("Attempting to load checkpoint...")
+            rank0_print("NOTE: DeepSpeed optimizer state loading is buggy - using warm restart strategy")
+            trainer.train(resume_from_checkpoint=str(latest_checkpoint))
+        except Exception as e:
+            rank0_print(f"ERROR during checkpoint loading: {e}")
+            
+            if ("world size" in str(e).lower() or 
+                "dp world size" in str(e).lower() or
+                "partition" in str(e).lower()):
+                rank0_print(f"DeepSpeed world size/partition mismatch detected: {e}")
+                rank0_print("Attempting fallback: Loading model weights only (WITHOUT optimizer state)...")
+                
+                # Load model weights manually
+                model_path = latest_checkpoint / "pytorch_model.bin"
+                if not model_path.exists():
+                    # Try safetensors format
+                    import glob
+                    safetensor_files = glob.glob(str(latest_checkpoint / "model*.safetensors"))
+                    if safetensor_files:
+                        rank0_print("Loading from safetensors format")
+                        from safetensors.torch import load_file
+                        state_dict = {}
+                        for file in safetensor_files:
+                            state_dict.update(load_file(file))
+                        model.load_state_dict(state_dict, strict=False)
+                        rank0_print("Model weights loaded successfully (NO optimizer state)")
+                    else:
+                        rank0_print("ERROR: No model files found in checkpoint!")
+                        raise ValueError(f"No model files found in {latest_checkpoint}")
+                
+                # Warn about loss implications
+                rank0_print("WARNING: Optimizer state NOT loaded - expect higher initial loss!")
+                rank0_print("Consider using same GPU count or converting checkpoint first.")
+                
+                # Start fresh training (no resume)
+                trainer.train()
+            else:
+                # Re-raise if it's a different error
+                rank0_print(f"Unknown error during checkpoint loading: {e}")
+                raise e
     else:
+        rank0_print("No checkpoint found - starting fresh training")
         trainer.train()
     
     # Save final model

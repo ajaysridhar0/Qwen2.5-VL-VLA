@@ -19,6 +19,10 @@ class FixedRatioSampler(Sampler):
     
     This is crucial for mixed training where one dataset (JSON) has much larger
     memory requirements than the other (VLA), preventing OOM from random batches.
+    
+    For very small ratios (< 1/batch_size), the sampler distributes JSON samples
+    across batches rather than forcing at least one JSON sample per batch, allowing
+    some batches to contain only VLA samples while maintaining the overall ratio.
     """
     
     def __init__(
@@ -37,6 +41,8 @@ class FixedRatioSampler(Sampler):
             dataset_size: Total size of the dataset
             batch_size: Size of each batch
             json_ratio: Ratio of JSON samples in each batch (0.0 to 1.0)
+                       For ratios < 1/batch_size, some batches will contain no JSON samples
+                       to maintain the overall ratio across the dataset
             shuffle: Whether to shuffle the data
             seed: Random seed for shuffling
             drop_last: Whether to drop the last incomplete batch
@@ -56,13 +62,74 @@ class FixedRatioSampler(Sampler):
         self.json_per_batch = int(batch_size * json_ratio)
         self.vla_per_batch = batch_size - self.json_per_batch
         
-        # Ensure we have at least one sample of the majority type
-        if self.json_per_batch == 0 and json_ratio > 0:
-            self.json_per_batch = 1
-            self.vla_per_batch = batch_size - 1
-        elif self.vla_per_batch == 0 and json_ratio < 1:
-            self.vla_per_batch = 1
-            self.json_per_batch = batch_size - 1
+        # For very small ratios, allow some batches to have no JSON samples
+        # Only force at least one sample if ratio is >= 1/batch_size
+        if json_ratio >= (1.0 / batch_size):
+            # Ensure we have at least one sample of the minority type
+            if self.json_per_batch == 0 and json_ratio > 0:
+                self.json_per_batch = 1
+                self.vla_per_batch = batch_size - 1
+            elif self.vla_per_batch == 0 and json_ratio < 1:
+                self.vla_per_batch = 1
+                self.json_per_batch = batch_size - 1
+        
+        # For distributed sampling with very small ratios, we need to track
+        # which batches should contain JSON samples
+        # Calculate how many batches we need to maintain the overall ratio
+        if json_ratio > 0 and self.json_per_batch == 0:
+            # We want json_ratio * total_samples = total_json_samples
+            # If we put 1 JSON sample every N batches: total_json_samples = total_batches / N
+            # So: json_ratio * total_batches * batch_size = total_batches / N
+            # Therefore: N = 1 / (json_ratio * batch_size)
+            # But we need to round properly to get close to the target ratio
+            cycle_length = 1.0 / (json_ratio * batch_size)
+            self.batches_per_json_cycle = max(1, round(cycle_length))
+            
+            # Calculate the actual ratio we'll achieve and validate it's reasonable
+            achieved_ratio = 1.0 / (self.batches_per_json_cycle * batch_size)
+            ratio_error = abs(achieved_ratio - json_ratio) / json_ratio
+            
+            # For very small ratios, we need to be more lenient with the error tolerance
+            # But still catch cases where the ratio is completely wrong
+            max_error = 1.0 if json_ratio < 0.01 else 0.5  # 100% error for very small ratios, 50% otherwise
+            
+            assert ratio_error <= max_error, (
+                f"FixedRatioSampler: Achieved ratio {achieved_ratio:.4f} is too far from "
+                f"target ratio {json_ratio:.4f} (error: {ratio_error:.1%}). "
+                f"Consider adjusting batch_size or json_ratio. "
+                f"With batch_size={batch_size}, batches_per_json_cycle={self.batches_per_json_cycle}"
+            )
+            
+            # Additional check: ratio shouldn't be more than 10x different
+            assert achieved_ratio <= json_ratio * 10 and achieved_ratio >= json_ratio / 10, (
+                f"FixedRatioSampler: Achieved ratio {achieved_ratio:.4f} is more than 10x different "
+                f"from target ratio {json_ratio:.4f}. This suggests a configuration error."
+            )
+            
+            # Practical check: warn about very long cycles that might be impractical
+            if self.batches_per_json_cycle > 100:
+                import warnings
+                warnings.warn(
+                    f"FixedRatioSampler: Very long JSON cycle ({self.batches_per_json_cycle} batches). "
+                    f"With ratio {json_ratio:.4f} and batch_size {batch_size}, JSON samples will only "
+                    f"appear every {self.batches_per_json_cycle} batches. Consider increasing batch_size "
+                    f"or json_ratio if this is unintended.",
+                    UserWarning
+                )
+        else:
+            self.batches_per_json_cycle = float('inf')
+            
+            # For normal ratios, validate that we have reasonable allocation
+            if json_ratio > 0:
+                achieved_ratio = self.json_per_batch / batch_size
+                ratio_error = abs(achieved_ratio - json_ratio) / json_ratio
+                
+                # Assert that we're within 20% of the target ratio for normal ratios
+                assert ratio_error <= 0.2, (
+                    f"FixedRatioSampler: Achieved ratio {achieved_ratio:.4f} is too far from "
+                    f"target ratio {json_ratio:.4f} (error: {ratio_error:.1%}). "
+                    f"json_per_batch={self.json_per_batch}, batch_size={batch_size}"
+                )
             
         # Calculate total batches
         self.total_batches = dataset_size // batch_size
@@ -123,49 +190,99 @@ class FixedRatioSampler(Sampler):
             json_indices = self.json_indices
             vla_indices = self.vla_indices
         
-        # Create batches with fixed ratios
-        # Pre-allocate with exact size to avoid repeated memory allocations
-        total_samples = self.total_batches * self.batch_size
-        batch_indices = [0] * total_samples
-        
         # Pre-compute lengths to avoid repeated len() calls
         json_len = len(json_indices)
         vla_len = len(vla_indices)
         
-        batch_idx = 0
-        for batch_num in range(self.total_batches):
-            batch_start = batch_idx
-            
-            # Add JSON samples using modulo arithmetic for wrapping
-            for i in range(self.json_per_batch):
-                json_idx = (batch_num * self.json_per_batch + i) % json_len
-                batch_indices[batch_idx] = json_indices[json_idx]
-                batch_idx += 1
-            
-            # Add VLA samples using modulo arithmetic for wrapping
-            for i in range(self.vla_per_batch):
-                vla_idx = (batch_num * self.vla_per_batch + i) % vla_len
-                batch_indices[batch_idx] = vla_indices[vla_idx]
-                batch_idx += 1
-            
-            # Shuffle within batch to mix JSON and VLA samples
-            if self.shuffle:
-                batch_end = batch_idx
-                batch_slice = batch_indices[batch_start:batch_end]
-                random.Random(self.seed + batch_num).shuffle(batch_slice)
-                batch_indices[batch_start:batch_end] = batch_slice
-        
-        # Handle distributed training - each rank gets its subset
+        # For distributed training, create batches per rank to ensure balanced distribution
         if self.num_replicas > 1:
-            # Ensure all replicas have the same total size
-            if len(batch_indices) < self.total_size * self.num_replicas:
-                # Pad with repeated indices
-                batch_indices += batch_indices[:self.total_size * self.num_replicas - len(batch_indices)]
+            # Calculate batches per rank
+            batches_per_rank = self.batches_per_replica
             
-            # Get this rank's subset
-            start_idx = self.rank * self.total_size
-            end_idx = start_idx + self.total_size
-            batch_indices = batch_indices[start_idx:end_idx]
+            # Create batches specifically for this rank
+            batch_indices = []
+            
+            for local_batch_num in range(batches_per_rank):
+                # Calculate global batch number for this rank
+                global_batch_num = self.rank * batches_per_rank + local_batch_num
+                
+                batch_start_idx = len(batch_indices)
+                
+                # Determine if this batch should contain JSON samples
+                json_samples_in_batch = self.json_per_batch
+                vla_samples_in_batch = self.vla_per_batch
+                
+                # For very small ratios, distribute JSON samples across batches
+                if self.json_per_batch == 0 and json_len > 0:
+                    # Only include JSON samples in some batches to maintain overall ratio
+                    if global_batch_num % self.batches_per_json_cycle == 0:
+                        json_samples_in_batch = 1
+                        vla_samples_in_batch = self.batch_size - 1
+                    else:
+                        json_samples_in_batch = 0
+                        vla_samples_in_batch = self.batch_size
+                
+                # Add JSON samples using modulo arithmetic for wrapping
+                if json_samples_in_batch > 0 and json_len > 0:
+                    for i in range(json_samples_in_batch):
+                        json_idx = (global_batch_num * json_samples_in_batch + i) % json_len
+                        batch_indices.append(json_indices[json_idx])
+                
+                # Add VLA samples using modulo arithmetic for wrapping
+                if vla_samples_in_batch > 0 and vla_len > 0:
+                    for i in range(vla_samples_in_batch):
+                        vla_idx = (global_batch_num * vla_samples_in_batch + i) % vla_len
+                        batch_indices.append(vla_indices[vla_idx])
+                
+                # Shuffle within batch to mix JSON and VLA samples
+                if self.shuffle:
+                    batch_end_idx = len(batch_indices)
+                    batch_slice = batch_indices[batch_start_idx:batch_end_idx]
+                    random.Random(self.seed + global_batch_num).shuffle(batch_slice)
+                    batch_indices[batch_start_idx:batch_end_idx] = batch_slice
+        else:
+            # Single process training - use original logic
+            total_samples = self.total_batches * self.batch_size
+            batch_indices = [0] * total_samples
+            
+            batch_idx = 0
+            for batch_num in range(self.total_batches):
+                batch_start = batch_idx
+                
+                # Determine if this batch should contain JSON samples
+                json_samples_in_batch = self.json_per_batch
+                vla_samples_in_batch = self.vla_per_batch
+                
+                # For very small ratios, distribute JSON samples across batches
+                if self.json_per_batch == 0 and json_len > 0:
+                    # Only include JSON samples in some batches to maintain overall ratio
+                    if batch_num % self.batches_per_json_cycle == 0:
+                        json_samples_in_batch = 1
+                        vla_samples_in_batch = self.batch_size - 1
+                    else:
+                        json_samples_in_batch = 0
+                        vla_samples_in_batch = self.batch_size
+                
+                # Add JSON samples using modulo arithmetic for wrapping
+                if json_samples_in_batch > 0 and json_len > 0:
+                    for i in range(json_samples_in_batch):
+                        json_idx = (batch_num * json_samples_in_batch + i) % json_len
+                        batch_indices[batch_idx] = json_indices[json_idx]
+                        batch_idx += 1
+                
+                # Add VLA samples using modulo arithmetic for wrapping
+                if vla_samples_in_batch > 0 and vla_len > 0:
+                    for i in range(vla_samples_in_batch):
+                        vla_idx = (batch_num * vla_samples_in_batch + i) % vla_len
+                        batch_indices[batch_idx] = vla_indices[vla_idx]
+                        batch_idx += 1
+                
+                # Shuffle within batch to mix JSON and VLA samples
+                if self.shuffle:
+                    batch_end = batch_idx
+                    batch_slice = batch_indices[batch_start:batch_end]
+                    random.Random(self.seed + batch_num).shuffle(batch_slice)
+                    batch_indices[batch_start:batch_end] = batch_slice
         
         # Drop last incomplete batch if needed
         if self.drop_last and len(batch_indices) % self.batch_size != 0:

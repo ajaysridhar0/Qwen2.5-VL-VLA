@@ -36,6 +36,7 @@ class GenerationLoggingCallback(TrainerCallback):
         num_examples=10,
         log_file="generations.txt",
         log_to_wandb=True,
+        eval_on_start=False,
     ):
         self.tokenizer = tokenizer
         self.action_tokenizer = action_tokenizer
@@ -43,6 +44,7 @@ class GenerationLoggingCallback(TrainerCallback):
         self.num_examples = num_examples
         self.log_file = log_file
         self.log_to_wandb = log_to_wandb
+        self.eval_on_start = eval_on_start
         self.action_token_ids = set(token_mappings['action_token_ids'])
         self.action_start_id = token_mappings['action_start_id']
         self.action_end_id = token_mappings['action_end_id']
@@ -58,6 +60,16 @@ class GenerationLoggingCallback(TrainerCallback):
     def on_train_begin(self, args, state, control, **kwargs):
         """Called at the beginning of training."""
         rank0_print(f"[GenerationLogger] on_train_begin called - callback is active!")
+        rank0_print(f"[GenerationLogger] eval_on_start = {self.eval_on_start}")
+        
+        # If eval_on_start is enabled, force an immediate evaluation
+        if self.eval_on_start:
+            rank0_print(f"[GenerationLogger] eval_on_start enabled - forcing immediate evaluation at step {state.global_step}")
+            # Trigger evaluation by calling on_evaluate directly
+            self.on_evaluate(args, state, control, **kwargs)
+        else:
+            rank0_print(f"[GenerationLogger] eval_on_start disabled - skipping initial evaluation")
+        
         return control
         
     def on_evaluate(self, args, state, control, **kwargs):
@@ -72,8 +84,8 @@ class GenerationLoggingCallback(TrainerCallback):
         if self.model is None or self.eval_dataloader is None:
             rank0_print("[GenerationLogger] Skipping generation logging - model or eval_dataloader not available")
             return control
-        if state.global_step == 0:
-            rank0_print("[GenerationLogger] Skipping generation logging - step 0")
+        if state.global_step == 0 and not self.eval_on_start:
+            rank0_print("[GenerationLogger] Skipping generation logging - step 0 and eval_on_start=False")
             return control
             
         try:
@@ -288,8 +300,8 @@ class GenerationLoggingCallback(TrainerCallback):
                             'step': state.global_step,
                             'example_idx': json_examples_processed,
                             'input_text': input_text[-500:],  # Last 500 chars to avoid too long
-                            'gt_text': gt_text[:200],  # Limit for display
-                            'pred_text': pred_text[:200],
+                            'gt_text': gt_text,  # Limit for display
+                            'pred_text': pred_text,
                             'is_correct': is_correct,
                             'type': 'json',
                         }
