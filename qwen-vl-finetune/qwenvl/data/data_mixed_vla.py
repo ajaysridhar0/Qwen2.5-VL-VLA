@@ -20,6 +20,7 @@ import os
 
 # Import existing components
 from .data_droid import DroidVLADataset, DroidDataCollator, normalize_action, denormalize_action
+# from .data_droid_iterable import DroidVLADatasetIterable
 
 # Import the original preprocessing function that handles both image and video tokens
 from .data_qwen import (
@@ -133,16 +134,19 @@ class MixedVLADataset(Dataset):
         # Create a helper instance to access image/video processing methods from data_qwen.py
         # This ensures we use the tested functions that work properly with gradient checkpointing
         self._qwen_dataset_helper = self._create_qwen_helper(tokenizer, data_args)
-        
-        # Initialize VLA dataset
-        self.vla_dataset = DroidVLADataset(
-            tokenizer=tokenizer,
-            data_args=data_args,
-            action_tokenizer=action_tokenizer,
-            model_max_length=model_max_length,
-            token_mappings=token_mappings,
-            image_size=image_size,
-        )
+
+        if cotrain_json_ratio < 1:
+            # Initialize VLA dataset
+            self.vla_dataset = DroidVLADataset(
+                tokenizer=tokenizer,
+                data_args=data_args,
+                action_tokenizer=action_tokenizer,
+                model_max_length=model_max_length,
+                token_mappings=token_mappings,
+                image_size=image_size,
+            )
+        else:
+            self.vla_dataset = None
 
         if data_args.model_type == "qwen2.5vl":
             self.get_rope_index = get_rope_index_25
@@ -163,10 +167,11 @@ class MixedVLADataset(Dataset):
                     rank0_print(f"  Dataset {i}: {size} samples, weight={weight:.3f}")
         
         # Calculate effective dataset size and sampling ratios
-        self.vla_size = len(self.vla_dataset)
+        self.vla_size = len(self.vla_dataset) if self.vla_dataset else 0
         
         # Handle count-based weighting that includes VLA dataset
         if hasattr(data_args, 'weight_by_count') and data_args.weight_by_count and self.json_dataset:
+            raise NotImplementedError("Count-based weighting is not supported when VLA dataset is disabled")
             rank0_print("Using count-based weighting for all datasets (including VLA)")
             
             # Calculate weights for all datasets including VLA
@@ -684,11 +689,6 @@ class MixedVLADataset(Dataset):
         """Process a single video file for JSON data using the tested function from data_qwen.py."""
         return self._qwen_dataset_helper.process_video(video_file)
     
-    # def process_video_from_frames(self, frame_paths):
-    #     """Process video from a list of frame image paths using the tested function from data_qwen.py."""
-    #     # Construct full paths
-    #     return self._qwen_dataset_helper.process_video_from_frames(frame_paths)
-    
     def __getitem__(self, idx):
         """Get a mixed training example - either VLA or JSON based on ratio."""
         
@@ -787,140 +787,21 @@ class MixedVLADataCollator:
             concat_videos = None
             video_grid_thw = None
 
-        batch["pixel_values"] = concat_images
-        batch["image_grid_thw"] = grid_thw
-        batch["pixel_values_videos"] = concat_videos
-        batch["video_grid_thw"] = video_grid_thw
+        # batch["pixel_values"] = concat_images
+        # batch["image_grid_thw"] = grid_thw
+        # batch["pixel_values_videos"] = concat_videos
+        # batch["video_grid_thw"] = video_grid_thw
+        # Only add fields that are not None to avoid Accelerate concatenation errors
+        if concat_images is not None:
+            batch["pixel_values"] = concat_images
+        if grid_thw is not None:
+            batch["image_grid_thw"] = grid_thw
+        if concat_videos is not None:
+            batch["pixel_values_videos"] = concat_videos
+        if video_grid_thw is not None:
+            batch["video_grid_thw"] = video_grid_thw
         batch["position_ids"] = position_ids
         return batch
-
-        # # Extract input_ids, labels, and position_ids, ensuring they are proper tensors
-        # input_ids = []
-        # labels = []
-        # position_ids = []
-        # has_position_ids = "position_ids" in instances[0]
-        
-        # for instance in instances:
-        #     input_id = instance["input_ids"]
-        #     label = instance["labels"]
-            
-        #     # Ensure tensors are 1D
-        #     if input_id.dim() > 1:
-        #         input_id = input_id.squeeze()
-        #     if label.dim() > 1:
-        #         label = label.squeeze()
-                
-        #     input_ids.append(input_id)
-        #     labels.append(label)
-            
-        #     # Handle position_ids if present
-        #     if has_position_ids:
-        #         pos_id = instance.get("position_ids")
-        #         if pos_id is not None:
-        #             position_ids.append(pos_id)
-        
-        # # Pad sequences
-        # input_ids = torch.nn.utils.rnn.pad_sequence(
-        #     input_ids,
-        #     batch_first=True,
-        #     padding_value=self.tokenizer.pad_token_id
-        # )
-        # labels = torch.nn.utils.rnn.pad_sequence(
-        #     labels,
-        #     batch_first=True,
-        #     padding_value=-100
-        # )
-        
-        # # Create attention mask
-        # attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
-        
-        # batch = {
-        #     "input_ids": input_ids,
-        #     "labels": labels,
-        #     "attention_mask": attention_mask,
-        # }
-        
-        # # Handle position_ids if present
-        # if has_position_ids and position_ids:
-        #     # Use pad_and_cat from data_qwen.py for proper position_ids padding
-        #     position_ids = pad_and_cat(position_ids)
-        #     # Ensure position_ids matches the sequence length of input_ids
-        #     seq_len = input_ids.shape[1]
-        #     if position_ids.shape[2] > seq_len:
-        #         # Truncate to match input_ids sequence length
-        #         position_ids = position_ids[:, :, :seq_len]
-        #     elif position_ids.shape[2] < seq_len:
-        #         # Pad to match input_ids sequence length
-        #         pad_size = seq_len - position_ids.shape[2]
-        #         position_ids = torch.nn.functional.pad(position_ids, (0, pad_size), "constant", 1)
-        #     batch["position_ids"] = position_ids
-        
-        # # Handle images and videos - collect all pixel values and grid_thw
-        # all_pixel_values = []
-        # all_grid_thw = []
-        # all_video_values = []
-        # all_video_grid_thw = []
-        
-        # for instance in instances:
-        #     # Handle image data (can coexist with video data)
-        #     if "pixel_values" in instance and instance["pixel_values"] is not None:
-        #         pixel_vals = instance["pixel_values"]
-        #         grid_thw = instance["image_grid_thw"]
-                
-        #         # Ensure grid_thw is 2D: [N, 3]
-        #         if grid_thw.dim() == 1:  # [3] -> [1, 3]
-        #             grid_thw = grid_thw.unsqueeze(0)
-        #         elif grid_thw.dim() == 2:  # [N, 3] - already correct
-        #             pass
-        #         else:
-        #             print(f"Warning: Unexpected image grid_thw dimensions: {grid_thw.shape}")
-        #             # Try to reshape to [N, 3]
-        #             if grid_thw.numel() % 3 == 0:
-        #                 grid_thw = grid_thw.reshape(-1, 3)
-        #             else:
-        #                 continue
-                
-        #         all_pixel_values.append(pixel_vals)
-        #         all_grid_thw.append(grid_thw)
-            
-        #     # Handle video data (can coexist with image data)
-        #     if "pixel_values_videos" in instance and instance["pixel_values_videos"] is not None:
-        #         video_vals = instance["pixel_values_videos"]
-        #         video_grid_thw = instance["video_grid_thw"]
-                
-        #         # Ensure video_grid_thw is 2D: [N, 3]
-        #         if video_grid_thw.dim() == 1:  # [3] -> [1, 3]
-        #             video_grid_thw = video_grid_thw.unsqueeze(0)
-        #         elif video_grid_thw.dim() == 2:  # [N, 3] - already correct
-        #             pass
-        #         else:
-        #             print(f"Warning: Unexpected video grid_thw dimensions: {video_grid_thw.shape}")
-        #             # Try to reshape to [N, 3]
-        #             if video_grid_thw.numel() % 3 == 0:
-        #                 video_grid_thw = video_grid_thw.reshape(-1, 3)
-        #             else:
-        #                 continue
-                
-        #         all_video_values.append(video_vals)
-        #         all_video_grid_thw.append(video_grid_thw)
-        
-        # # Set image data
-        # if all_pixel_values:
-        #     batch["pixel_values"] = torch.cat(all_pixel_values, dim=0)
-        #     batch["image_grid_thw"] = torch.cat(all_grid_thw, dim=0)
-        # else:
-        #     batch["pixel_values"] = None
-        #     batch["image_grid_thw"] = None
-        
-        # # Set video data
-        # if all_video_values:
-        #     batch["pixel_values_videos"] = torch.cat(all_video_values, dim=0)
-        #     batch["video_grid_thw"] = torch.cat(all_video_grid_thw, dim=0)
-        # else:
-        #     batch["pixel_values_videos"] = None
-        #     batch["video_grid_thw"] = None
-        
-        # return batch
 
 
 def make_mixed_vla_data_module(

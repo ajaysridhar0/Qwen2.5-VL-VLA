@@ -18,6 +18,15 @@ import numpy as np
 from datetime import datetime
 import wandb
 
+from torch.utils.data import DataLoader, IterableDataset
+from transformers.trainer_utils import seed_worker
+from transformers.utils import is_datasets_available
+
+try:
+    import datasets
+except ImportError:
+    datasets = None
+
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
@@ -32,6 +41,10 @@ from transformers import (
 )
 from qwenvl.data.data_droid import make_droid_data_module
 from qwenvl.data.data_mixed_vla import make_mixed_vla_data_module
+from qwenvl.data.data_fixed_mixed_vla import make_fixed_mixed_val_data_module
+from qwenvl.data.data_proportional_mixed_vla import make_proportional_mixed_val_data_module
+# from qwenvl.data.data_droid_iterable import make_droid_data_module_iterable
+
 from qwenvl.train.argument import (
     ModelArguments,
     DataArguments,
@@ -82,6 +95,66 @@ class CheckpointProcessorCallback(TrainerCallback):
 class VLATrainer(Trainer):
     """Custom trainer that supports fixed ratio sampling for mixed VLA/JSON training."""
     
+    def get_train_dataloader(self) -> DataLoader:
+        """
+        Returns the training [`~torch.utils.data.DataLoader`].
+
+        This is an override of the original method to prevent `accelerator.prepare()`
+        from wrapping the DataLoader when using an IterableDataset. This is because
+        the accelerator wrapper incorrectly reshapes tensors with mismatched first
+        dimensions (e.g., pixel_values vs. input_ids), which corrupts the batch.
+        Device placement is handled by our overridden `_prepare_inputs` method.
+        """
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset.")
+
+        train_dataset = self.train_dataset
+        data_collator = self.data_collator
+        
+        if is_datasets_available() and isinstance(train_dataset, datasets.Dataset):
+            train_dataset = self._remove_unused_columns(train_dataset, description="training")
+        else:
+            data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
+
+        dataloader_params = {
+            "batch_size": self._train_batch_size,
+            "collate_fn": data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
+        }
+
+        if not isinstance(train_dataset, IterableDataset):
+            dataloader_params["sampler"] = self._get_train_sampler()
+            dataloader_params["drop_last"] = self.args.dataloader_drop_last
+            dataloader_params["worker_init_fn"] = seed_worker
+            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+
+        dl = DataLoader(train_dataset, **dataloader_params)
+
+        if isinstance(train_dataset, IterableDataset):
+            # For IterableDatasets, return the raw DataLoader.
+            # Our `_prepare_inputs` override will handle device placement.
+            return dl
+        
+        # For map-style datasets, the accelerator wrapper works correctly.
+        return self.accelerator.prepare(dl)
+
+    def _prepare_inputs(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Override the default _prepare_inputs to manually move tensors to the correct device,
+        bypassing the accelerator.prepare() that was incorrectly reshaping the pixel_values tensor
+        for IterableDatasets.
+        """
+        # Manually move each tensor to the designated device
+        prepared_inputs = {}
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor):
+                prepared_inputs[k] = v.to(self.args.device)
+            else:
+                prepared_inputs[k] = v
+        return prepared_inputs
+
     def __init__(self, *args, train_sampler_params=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.train_sampler_params = train_sampler_params
@@ -92,51 +165,34 @@ class VLATrainer(Trainer):
         self._json_loss_count = 0
         self._log_interval = self.args.logging_steps  # Sync with Trainer's logging steps
     
-    def _get_train_sampler(self):
-        """Override to use our custom fixed ratio sampler if params are provided."""
-        if self.train_sampler_params is not None:
-            # Extract sampler class and params
-            sampler_class = self.train_sampler_params["sampler_class"]
-            dataset_size = self.train_sampler_params["dataset_size"]
-            json_ratio = self.train_sampler_params["json_ratio"]
+    # def _get_train_sampler(self):
+    #     """Override to use our custom fixed ratio sampler if params are provided."""
+    #     if self.train_sampler_params is not None:
+    #         # Extract sampler class and params
+    #         sampler_class = self.train_sampler_params["sampler_class"]
+    #         dataset_size = self.train_sampler_params["dataset_size"]
+    #         json_ratio = self.train_sampler_params["json_ratio"]
             
-            # Create the sampler with proper batch size
-            sampler = sampler_class(
-                dataset_size=dataset_size,
-                batch_size=self.args.per_device_train_batch_size,
-                json_ratio=json_ratio,
-                num_replicas=self.args.world_size,
-                rank=self.args.process_index,
-                shuffle=True,
-                seed=self.args.seed,
-                drop_last=self.args.dataloader_drop_last,
-            )
+    #         # Create the sampler with proper batch size
+    #         sampler = sampler_class(
+    #             dataset_size=dataset_size,
+    #             batch_size=self.args.per_device_train_batch_size,
+    #             json_ratio=json_ratio,
+    #             num_replicas=self.args.world_size,
+    #             rank=self.args.process_index,
+    #             shuffle=True,
+    #             seed=self.args.seed,
+    #             drop_last=self.args.dataloader_drop_last,
+    #         )
             
-            rank0_print(f"Using FixedRatioSampler with {json_ratio:.2f} JSON ratio per batch")
-            rank0_print(f"  JSON samples per batch: {sampler.json_per_batch}")
-            rank0_print(f"  VLA samples per batch: {sampler.vla_per_batch}")
+    #         rank0_print(f"Using FixedRatioSampler with {json_ratio:.2f} JSON ratio per batch")
+    #         rank0_print(f"  JSON samples per batch: {sampler.json_per_batch}")
+    #         rank0_print(f"  VLA samples per batch: {sampler.vla_per_batch}")
             
-            # Calculate and show the actual achieved ratio
-            if sampler.json_per_batch == 0 and hasattr(sampler, 'batches_per_json_cycle'):
-                if sampler.batches_per_json_cycle != float('inf'):
-                    achieved_ratio = 1.0 / (sampler.batches_per_json_cycle * self.args.per_device_train_batch_size)
-                    rank0_print(f"  Batches per JSON cycle: {sampler.batches_per_json_cycle}")
-                    rank0_print(f"  Actual achieved ratio: {achieved_ratio:.4f}")
-                    ratio_error = abs(achieved_ratio - json_ratio) / json_ratio * 100
-                    rank0_print(f"  Ratio error: {ratio_error:.1f}%")
-                else:
-                    rank0_print(f"  No JSON samples (ratio too small)")
-            else:
-                achieved_ratio = sampler.json_per_batch / self.args.per_device_train_batch_size
-                rank0_print(f"  Actual achieved ratio: {achieved_ratio:.4f}")
-                if json_ratio > 0:
-                    ratio_error = abs(achieved_ratio - json_ratio) / json_ratio * 100
-                    rank0_print(f"  Ratio error: {ratio_error:.1f}%")
-            
-            return sampler
-        else:
-            # Use default sampler
-            return super()._get_train_sampler()
+    #         return sampler
+    #     else:
+    #         # Use default sampler
+    #         return super()._get_train_sampler()
     
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
@@ -498,41 +554,51 @@ def train(attn_implementation="flash_attention_2"):
         rank0_print(f"Language model trainable: {model_args.tune_mm_llm}")
         rank0_print(f"Action vocabulary size: {action_vocab_size}")
     
-    # Create data module with token mappings
-    if data_args.enable_cotrain and data_args.cotrain_json_paths:
-        # Parse comma-separated JSON paths
-        json_paths = [path.strip() for path in data_args.cotrain_json_paths.split(",") if path.strip()]
-        data_args.cotrain_json_paths = json_paths
+    # # # Create data module with token mappings
+    # if data_args.enable_cotrain and data_args.cotrain_json_paths:
+    #     # Parse comma-separated JSON paths
+    #     json_paths = [path.strip() for path in data_args.cotrain_json_paths.split(",") if path.strip()]
+    #     data_args.cotrain_json_paths = json_paths
         
-        rank0_print(f"Co-training enabled with {len(json_paths)} JSON datasets")
-        rank0_print(f"JSON ratio: {data_args.cotrain_json_ratio:.2f}")
-        rank0_print(f"JSON paths: {json_paths}")
-        rank0_print(f"Image resize constraints: max_dim={data_args.max_image_dim}, min_dim={data_args.min_image_dim}")
-        rank0_print(f"Pixel budget: {data_args.pixel_budget:,} pixels per JSON query (VLA data unchanged)")
+    #     rank0_print(f"Co-training enabled with {len(json_paths)} JSON datasets")
+    #     rank0_print(f"JSON ratio: {data_args.cotrain_json_ratio:.2f}")
+    #     rank0_print(f"JSON paths: {json_paths}")
+    #     rank0_print(f"Image resize constraints: max_dim={data_args.max_image_dim}, min_dim={data_args.min_image_dim}")
+    #     rank0_print(f"Pixel budget: {data_args.pixel_budget:,} pixels per JSON query (VLA data unchanged)")
         
-        data_module = make_mixed_vla_data_module(
-            tokenizer=tokenizer,
-            action_tokenizer=action_tokenizer,
-            data_args=data_args,
-            model_max_length=training_args.model_max_length,
-            token_mappings=token_mappings,
-            image_size=(data_args.image_height, data_args.image_width),
-            cotrain_json_ratio=data_args.cotrain_json_ratio,
-            use_fixed_ratio_sampler=data_args.use_fixed_ratio_sampler,
-        )
-    else:
-        # Standard VLA-only training
-        rank0_print("VLA-only training (no co-training)")
-        rank0_print(f"Image resize constraints: max_dim={data_args.max_image_dim}, min_dim={data_args.min_image_dim}")
-        rank0_print(f"Pixel budget: {data_args.pixel_budget:,} pixels per JSON query (VLA data unchanged)")
-        data_module = make_droid_data_module(
-            tokenizer=tokenizer, 
-            action_tokenizer=action_tokenizer,
-            data_args=data_args,
-            model_max_length=training_args.model_max_length,
-            token_mappings=token_mappings,
-            image_size=(data_args.image_height, data_args.image_width)
-        )
+    #     data_module = make_mixed_vla_data_module(
+    #         tokenizer=tokenizer,
+    #         action_tokenizer=action_tokenizer,
+    #         data_args=data_args,
+    #         model_max_length=training_args.model_max_length,
+    #         token_mappings=token_mappings,
+    #         image_size=(data_args.image_height, data_args.image_width),
+    #         cotrain_json_ratio=data_args.cotrain_json_ratio,
+    #         use_fixed_ratio_sampler=data_args.use_fixed_ratio_sampler,
+    #     )
+    # else:
+    #     # Standard VLA-only training
+    #     rank0_print("VLA-only training (no co-training)")
+    #     rank0_print(f"Image resize constraints: max_dim={data_args.max_image_dim}, min_dim={data_args.min_image_dim}")
+    #     rank0_print(f"Pixel budget: {data_args.pixel_budget:,} pixels per JSON query (VLA data unchanged)")
+    #     data_module = make_droid_data_module(
+    #         tokenizer=tokenizer, 
+    #         action_tokenizer=action_tokenizer,
+    #         data_args=data_args,
+    #         model_max_length=training_args.model_max_length,
+    #         token_mappings=token_mappings,
+    #         image_size=(data_args.image_height, data_args.image_width)
+    #     )
+
+    data_module = make_proportional_mixed_val_data_module(
+        tokenizer=tokenizer,
+        action_tokenizer=action_tokenizer,
+        data_args=data_args,
+        model_max_length=training_args.model_max_length,
+        token_mappings=token_mappings,
+        image_size=(data_args.image_height, data_args.image_width),
+        cotrain_json_ratio=data_args.cotrain_json_ratio,
+    )
     
     # Create generation logging callback with the shared action tokenizer
     # The action tokenizer will be initialized through normal data loading
@@ -558,6 +624,7 @@ def train(attn_implementation="flash_attention_2"):
     train_sampler_params = data_module.pop('train_sampler_params', None)
     
     # Initialize trainer with callbacks
+    
     trainer = VLATrainer(
         model=model, 
         processing_class=tokenizer, 
