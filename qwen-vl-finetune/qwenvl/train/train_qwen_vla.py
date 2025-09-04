@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 from datetime import datetime
 import wandb
+from accelerate import Accelerator
 
 from torch.utils.data import DataLoader, IterableDataset
 from transformers.trainer_utils import seed_worker
@@ -50,7 +51,7 @@ from qwenvl.train.argument import (
     DataArguments,
     TrainingArguments,
 )
-from qwenvl.train.generation_callback import GenerationLoggingCallback
+from qwenvl.train.simple_generation_logger import SimpleGenerationLogger
 from transformers import AutoTokenizer, AutoProcessor, Qwen2VLImageProcessor, Trainer, TrainerCallback
 # from qwenvl.train.trainer import EMATrainer  # TODO: Uncomment when implementing custom EMA
 from dataclasses import dataclass, field
@@ -92,30 +93,90 @@ class CheckpointProcessorCallback(TrainerCallback):
         return control
 
 
+
+import random
+
+class BatchShuffleWrapper:
+    """Wraps an iterator to shuffle yielded batches in a buffer."""
+    def __init__(self, dataloader, buffer_size: int = 100):
+        self.dataloader = dataloader
+        self.buffer_size = buffer_size
+
+    def __iter__(self):
+        buffer = []
+        for batch in self.dataloader:
+            if len(buffer) < self.buffer_size:
+                buffer.append(batch)
+            else:
+                # When buffer is full, yield a random item and replace it
+                idx_to_yield = random.randint(0, self.buffer_size - 1)
+                yield buffer[idx_to_yield]
+                buffer[idx_to_yield] = batch
+        
+        # Yield all remaining items in the buffer
+        random.shuffle(buffer)
+        for batch in buffer:
+            yield batch
+
+
 class VLATrainer(Trainer):
-    """Custom trainer that supports fixed ratio sampling for mixed VLA/JSON training."""
+    
+    def _inner_training_loop(
+        self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
+    ):
+        """
+        Override the inner training loop to prevent skip_first_batches from being called
+        on iterable datasets during checkpoint resumption.
+        """
+        # Check if we have an iterable dataset and are resuming from checkpoint
+        if (isinstance(self.train_dataset, IterableDataset) and 
+            resume_from_checkpoint is not None):
+            
+            # Temporarily set ignore_data_skip to True to prevent skip_first_batches
+            original_ignore_data_skip = args.ignore_data_skip if args else self.args.ignore_data_skip
+            if args:
+                args.ignore_data_skip = True
+            else:
+                self.args.ignore_data_skip = True
+            
+            rank0_print("🚀 Preventing skip_first_batches for iterable dataset - samples_to_skip was already applied during dataset creation")
+            
+            try:
+                # Call the parent implementation with ignore_data_skip=True
+                result = super()._inner_training_loop(batch_size, args, resume_from_checkpoint, trial, ignore_keys_for_eval)
+            finally:
+                # Restore original setting
+                if args:
+                    args.ignore_data_skip = original_ignore_data_skip
+                else:
+                    self.args.ignore_data_skip = original_ignore_data_skip
+            
+            return result
+        else:
+            # For non-iterable datasets or non-resuming cases, use default behavior
+            return super()._inner_training_loop(batch_size, args, resume_from_checkpoint, trial, ignore_keys_for_eval)
     
     def get_train_dataloader(self) -> DataLoader:
         """
-        Returns the training [`~torch.utils.data.DataLoader`].
-
-        This is an override of the original method to prevent `accelerator.prepare()`
-        from wrapping the DataLoader when using an IterableDataset. This is because
-        the accelerator wrapper incorrectly reshapes tensors with mismatched first
-        dimensions (e.g., pixel_values vs. input_ids), which corrupts the batch.
-        Device placement is handled by our overridden `_prepare_inputs` method.
+        Overrides the default train dataloader to handle efficient checkpoint resumption
+        for iterable datasets using samples_to_skip instead of skip_first_batches.
         """
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
 
         train_dataset = self.train_dataset
-        data_collator = self.data_collator
         
+
+
+        # --- Standard setup ---
+        data_collator = self.data_collator
+
         if is_datasets_available() and isinstance(train_dataset, datasets.Dataset):
             train_dataset = self._remove_unused_columns(train_dataset, description="training")
         else:
             data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
 
+        # We know our dataset is iterable, so we don't need a sampler
         dataloader_params = {
             "batch_size": self._train_batch_size,
             "collate_fn": data_collator,
@@ -124,38 +185,30 @@ class VLATrainer(Trainer):
             "persistent_workers": self.args.dataloader_persistent_workers,
         }
 
-        if not isinstance(train_dataset, IterableDataset):
+        if not isinstance(train_dataset, torch.utils.data.IterableDataset):
             dataloader_params["sampler"] = self._get_train_sampler()
             dataloader_params["drop_last"] = self.args.dataloader_drop_last
             dataloader_params["worker_init_fn"] = seed_worker
             dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
 
-        dl = DataLoader(train_dataset, **dataloader_params)
+        # 1. Create the standard DataLoader
+        dataloader = DataLoader(train_dataset, **dataloader_params)
 
+        # # # # 2. Apply our custom batch shuffling wrapper
+        # # # shuffled_dataloader = BatchShuffleWrapper(dataloader, buffer_size=128)
         if isinstance(train_dataset, IterableDataset):
             # For IterableDatasets, return the raw DataLoader.
             # Our `_prepare_inputs` override will handle device placement.
-            return dl
-        
-        # For map-style datasets, the accelerator wrapper works correctly.
-        return self.accelerator.prepare(dl)
+            return dataloader
 
-    def _prepare_inputs(self, inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """
-        Override the default _prepare_inputs to manually move tensors to the correct device,
-        bypassing the accelerator.prepare() that was incorrectly reshaping the pixel_values tensor
-        for IterableDatasets.
-        """
-        # Manually move each tensor to the designated device
-        prepared_inputs = {}
-        for k, v in inputs.items():
-            if isinstance(v, torch.Tensor):
-                prepared_inputs[k] = v.to(self.args.device)
-            else:
-                prepared_inputs[k] = v
-        return prepared_inputs
+        # 3. **Crucially, ALWAYS pass the final dataloader to the accelerator.**
+        # This ensures correct data sharding across all GPUs.
+        return self.accelerator.prepare(dataloader)
+    
 
-    def __init__(self, *args, train_sampler_params=None, **kwargs):
+
+
+    def __init__(self, *args, train_sampler_params=None, generation_logger=None, generation_interval=500, **kwargs):
         super().__init__(*args, **kwargs)
         self.train_sampler_params = train_sampler_params
         # Initialize metrics for separate loss tracking
@@ -164,35 +217,13 @@ class VLATrainer(Trainer):
         self._json_loss_sum = 0.0
         self._json_loss_count = 0
         self._log_interval = self.args.logging_steps  # Sync with Trainer's logging steps
+        
+        # Generation logging setup
+        self.generation_logger = generation_logger
+        self.generation_interval = generation_interval
+        self._last_generation_step = -1
     
-    # def _get_train_sampler(self):
-    #     """Override to use our custom fixed ratio sampler if params are provided."""
-    #     if self.train_sampler_params is not None:
-    #         # Extract sampler class and params
-    #         sampler_class = self.train_sampler_params["sampler_class"]
-    #         dataset_size = self.train_sampler_params["dataset_size"]
-    #         json_ratio = self.train_sampler_params["json_ratio"]
-            
-    #         # Create the sampler with proper batch size
-    #         sampler = sampler_class(
-    #             dataset_size=dataset_size,
-    #             batch_size=self.args.per_device_train_batch_size,
-    #             json_ratio=json_ratio,
-    #             num_replicas=self.args.world_size,
-    #             rank=self.args.process_index,
-    #             shuffle=True,
-    #             seed=self.args.seed,
-    #             drop_last=self.args.dataloader_drop_last,
-    #         )
-            
-    #         rank0_print(f"Using FixedRatioSampler with {json_ratio:.2f} JSON ratio per batch")
-    #         rank0_print(f"  JSON samples per batch: {sampler.json_per_batch}")
-    #         rank0_print(f"  VLA samples per batch: {sampler.vla_per_batch}")
-            
-    #         return sampler
-    #     else:
-    #         # Use default sampler
-    #         return super()._get_train_sampler()
+    
     
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
@@ -265,8 +296,36 @@ class VLATrainer(Trainer):
         if self.state.global_step > 0 and self.state.global_step % self._log_interval == 0:
             self._log_separate_losses()
         
+        # Run generation logging at specified intervals (only on rank 0)
+        if (self.generation_logger is not None and 
+            self.state.global_step > 0 and 
+            self.state.global_step % self.generation_interval == 0 and
+            self.state.global_step != self._last_generation_step and
+            self.args.local_rank in [-1, 0]):  # Only run on rank 0
+            
+            self._last_generation_step = self.state.global_step
+            self._run_generation_logging(inputs)
+        
         return (loss, outputs) if return_outputs else loss
     
+    def _run_generation_logging(self, current_batch):
+        """Run generation logging using the current batch as a sample. Only called on rank 0."""
+        try:
+            rank0_print(f"\n[GenerationLogger] Running generation logging at step {self.state.global_step}")
+            
+            # Call the generation logger with the current batch
+            self.generation_logger.log_generations_from_batch(
+                model=self.model,
+                batch=current_batch,
+                step=self.state.global_step,
+                args=self.args
+            )
+            
+        except Exception as e:
+            rank0_print(f"[GenerationLogger] Error during generation logging: {e}")
+            import traceback
+            traceback.print_exc()
+
     def _log_separate_losses(self):
         """Log separate losses to wandb and console."""
         metrics = {}
@@ -287,18 +346,17 @@ class VLATrainer(Trainer):
             self._json_loss_sum = 0.0
             self._json_loss_count = 0
         
-        # Log to wandb if available
-        if len(metrics) > 0:
+        # Log to wandb if available (only on rank 0)
+        if len(metrics) > 0 and self.args.local_rank in [-1, 0]:
             self.log(metrics)
             
             # Also print to console
-            if self.args.local_rank in [-1, 0]:
-                log_str = f"Step {self.state.global_step}: "
-                if "train/droid_loss" in metrics:
-                    log_str += f"droid_loss={metrics['train/droid_loss']:.4f} "
-                if "train/json_loss" in metrics:
-                    log_str += f"json_loss={metrics['train/json_loss']:.4f}"
-                rank0_print(log_str)
+            log_str = f"Step {self.state.global_step}: "
+            if "train/droid_loss" in metrics:
+                log_str += f"droid_loss={metrics['train/droid_loss']:.4f} "
+            if "train/json_loss" in metrics:
+                log_str += f"json_loss={metrics['train/json_loss']:.4f}"
+            rank0_print(log_str)
     
     def on_train_end(self, args, state, control, **kwargs):
         """Log any remaining losses at the end of training."""
@@ -336,24 +394,25 @@ class VLADataArguments(DataArguments):
     use_fixed_ratio_sampler: bool = field(default=True, metadata={"help": "Use fixed ratio sampler to ensure consistent memory usage per batch"})
     pixel_budget: int = field(default=230400, metadata={"help": "Max pixels per JSON query (default: 230400 = 4x VLA size). For multi-frame JSON, budget applies to total pixels across all frames."})
     
+    # Dataset type selection
+    dataset_type: str = field(default="proportional", metadata={"help": "Dataset mixing type: 'proportional' (probabilistic sampling) or 'fixed' (fixed ratio per batch with pre-collation)"})
+    
     # Individual dataset weighting options
     cotrain_json_weights: str = field(default="", metadata={"help": "Comma-separated weights for individual JSON datasets (must match number of JSON paths). If empty, uses equal weights."})
     weight_by_count: bool = field(default=False, metadata={"help": "Weight all datasets (including droid) by their sample count instead of using fixed ratios"})
     count_weight_power: float = field(default=1.0, metadata={"help": "Power to raise dataset counts to when using count-based weighting (e.g., 0.5 for square root, 1.0 for linear)"})
-    
-
 
 
 @dataclass
 class VLATrainingArguments(TrainingArguments):
     """Extended training arguments with evaluation settings for VLA."""
     evaluation_strategy: str = field(
-        default="steps",
+        default="no",
         metadata={"help": "The evaluation strategy to adopt during training."}
     )
     eval_steps: int = field(
         default=500,
-        metadata={"help": "Run an evaluation every X steps."}
+        metadata={"help": "Interval for generation logging (callback will trigger every X steps)."}
     )
     save_strategy: str = field(
         default="steps",
@@ -362,6 +421,10 @@ class VLATrainingArguments(TrainingArguments):
     logging_steps: int = field(
         default=10,
         metadata={"help": "Log every X updates steps."}
+    )
+    max_eval_samples: int = field(
+        default=100,
+        metadata={"help": "Maximum number of evaluation samples to use. The trainer will automatically limit the eval dataset to this size."}
     )
     num_generation_examples: int = field(
         default=10,
@@ -374,6 +437,14 @@ class VLATrainingArguments(TrainingArguments):
     eval_on_start: bool = field(
         default=False,
         metadata={"help": "Whether to run evaluation at the beginning of training (step 0)."}
+    )
+    generation_interval: int = field(
+        default=500,
+        metadata={"help": "Interval (in training steps) for running generation logging. If not specified, defaults to eval_steps."}
+    )
+    skip_samples: int = field(
+        default=None,
+        metadata={"help": "Number of samples to skip for checkpoint resumption. Use this instead of automatic calculation for faster startup."}
     )
     gradient_checkpointing_kwargs: dict = field(
         default_factory=lambda: {"use_reentrant": False},
@@ -489,17 +560,31 @@ def train(attn_implementation="flash_attention_2"):
     local_rank = training_args.local_rank
     os.makedirs(training_args.output_dir, exist_ok=True)
 
+    # Determine model load path and checkpoint for resuming
+    checkpoint_to_resume = None
+    model_load_path = model_args.model_name_or_path
+    
+    checkpoint_dirs = list(pathlib.Path(training_args.output_dir).glob("checkpoint-*"))
+    if checkpoint_dirs:
+        regular_checkpoints = [d for d in checkpoint_dirs if not d.name.endswith('_fixed')]
+        if regular_checkpoints:
+            latest_checkpoint = max(regular_checkpoints, key=lambda x: int(x.name.split('-')[1]))
+            rank0_print(f"Found latest checkpoint: {latest_checkpoint}")
+            model_load_path = str(latest_checkpoint)
+            checkpoint_to_resume = str(latest_checkpoint)
+
     # Load model
+    # Check original model name for 'qwen2.5' as checkpoint path might not contain it
     if "qwen2.5" in model_args.model_name_or_path.lower():
         # Use base model directly since we're only using existing tokens
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_args.model_name_or_path,
+            model_load_path,
             cache_dir=training_args.cache_dir,
             attn_implementation=attn_implementation,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
         )
         data_args.image_processor = AutoProcessor.from_pretrained(
-            model_args.model_name_or_path,
+            model_load_path, trust_remote_code=True
         ).image_processor
         data_args.model_type = "qwen2.5vl"
     else:
@@ -590,31 +675,54 @@ def train(attn_implementation="flash_attention_2"):
     #         image_size=(data_args.image_height, data_args.image_width)
     #     )
 
-    data_module = make_proportional_mixed_val_data_module(
-        tokenizer=tokenizer,
-        action_tokenizer=action_tokenizer,
-        data_args=data_args,
-        model_max_length=training_args.model_max_length,
-        token_mappings=token_mappings,
-        image_size=(data_args.image_height, data_args.image_width),
-        cotrain_json_ratio=data_args.cotrain_json_ratio,
-    )
+    # Use skip_samples from training arguments (user can set this manually)
+    # If resuming and skip_samples is 0, we'll use step-based seeding instead of skipping
+    checkpoint_step = 0
+    if checkpoint_to_resume:
+        checkpoint_step = int(pathlib.Path(checkpoint_to_resume).name.split('-')[1])
+        rank0_print(f"Resuming from checkpoint step {checkpoint_step}")
+        if training_args.skip_samples is None:
+            training_args.skip_samples = checkpoint_step * training_args.gradient_accumulation_steps * training_args.world_size * training_args.per_device_train_batch_size
+        rank0_print(f"Will skip {training_args.skip_samples:,} samples as specified")       
+
+    if training_args.skip_samples is None:
+        training_args.skip_samples = 0
+    # Store dataset creation arguments
+    dataset_creation_args = {
+        'tokenizer': tokenizer,
+        'action_tokenizer': action_tokenizer,
+        'data_args': data_args,
+        'model_max_length': training_args.model_max_length,
+        'token_mappings': token_mappings,
+        'image_size': (data_args.image_height, data_args.image_width),
+        'cotrain_json_ratio': data_args.cotrain_json_ratio,
+        'samples_to_skip': training_args.skip_samples,  # Use explicit argument
+        'seed': 42 + checkpoint_step,  # Use step-based seeding for randomness
+    }
     
-    # Create generation logging callback with the shared action tokenizer
+    # Choose dataset type based on data_args.dataset_type
+    if data_args.dataset_type == "fixed":
+        rank0_print("Using fixed ratio mixed dataset with pre-collation")
+        data_module = make_fixed_mixed_val_data_module(**dataset_creation_args)
+    else:
+        rank0_print("Using proportional mixed dataset with probabilistic sampling")
+        data_module = make_proportional_mixed_val_data_module(**dataset_creation_args)
+    
+    # Create simplified generation logger for use in compute_loss
     # The action tokenizer will be initialized through normal data loading
     # call on dummy data to warmup the tokenizer
     action_data = np.random.rand(10, data_args.action_chunk_size, 8)    # one batch of action chunks
     _ = action_tokenizer(action_data)
     
-    rank0_print(f"Creating GenerationLoggingCallback with eval_on_start={training_args.eval_on_start}")
-    generation_callback = GenerationLoggingCallback(
+    rank0_print(f"Creating SimpleGenerationLogger")
+    rank0_print(f"Generation logging interval: {training_args.generation_interval} steps")
+    generation_logger = SimpleGenerationLogger(
         tokenizer=tokenizer,
         action_tokenizer=action_tokenizer,
         token_mappings=token_mappings,
-        num_examples=training_args.num_generation_examples,
+        num_examples=training_args.num_generation_examples,  # Use configurable number, will process up to batch_size
         log_file="generations.txt",
         log_to_wandb=training_args.log_generations_to_wandb,
-        eval_on_start=training_args.eval_on_start,
     )
     
     # Create checkpoint processor callback to save preprocessor config with each checkpoint
@@ -623,105 +731,50 @@ def train(attn_implementation="flash_attention_2"):
     # Extract sampler params if present
     train_sampler_params = data_module.pop('train_sampler_params', None)
     
-    # Initialize trainer with callbacks
+    # Initialize trainer with simplified generation logger
     
     trainer = VLATrainer(
         model=model, 
         processing_class=tokenizer, 
         args=training_args, 
-        callbacks=[generation_callback, checkpoint_processor_callback],
+        callbacks=[checkpoint_processor_callback],  # Only keep checkpoint processor
         train_sampler_params=train_sampler_params,  # Pass sampler params to custom trainer
+        generation_logger=generation_logger,  # Pass generation logger to trainer
+        generation_interval=training_args.generation_interval,  # Use configurable generation interval
         **data_module
     )
     
+
+    
     # Set action_start_id on trainer for loss separation
     trainer.action_start_id = token_mappings['action_start_id']
-    
-    # Set up the callback with trainer components
-    generation_callback.setup_trainer_components(
-        model=model,
-        eval_dataloader=trainer.get_eval_dataloader() if data_module['eval_dataset'] is not None else None
-    )
     
     # TODO: Switch to EMATrainer when implementing custom EMA support
     # trainer_class = EMATrainer if getattr(training_args, 'use_ema', False) else Trainer
     # trainer = trainer_class(model=model, processing_class=tokenizer, args=training_args, **data_module)
 
     # Start training
-    checkpoint_dirs = list(pathlib.Path(training_args.output_dir).glob("checkpoint-*"))
-    if checkpoint_dirs:
-        # Filter out fixed checkpoints and get the latest checkpoint
-        regular_checkpoints = [d for d in checkpoint_dirs if not d.name.endswith('_fixed')]
-        if not regular_checkpoints:
-            rank0_print("ERROR: No regular checkpoints found, only fixed ones")
-            trainer.train()
-            return
+    if checkpoint_to_resume:
+        rank0_print("="*20 + " CHECKPOINT RESUMPTION " + "="*20)
+        rank0_print(f"Attempting to resume full training state from: {checkpoint_to_resume}")
         
-        # Get the latest regular checkpoint
-        latest_checkpoint = max(regular_checkpoints, key=lambda x: int(x.name.split('-')[1]))
-        rank0_print(f"=== CHECKPOINT LOADING ===")
-        rank0_print(f"Found checkpoint: {latest_checkpoint}")
-        
-        # Verify checkpoint integrity
-        global_step_dir = latest_checkpoint / "global_step*"
-        global_step_dirs = list(latest_checkpoint.glob("global_step*"))
-        trainer_state_file = latest_checkpoint / "trainer_state.json"
-        
-        if not global_step_dirs:
-            rank0_print(f"WARNING: No global_step directory found in {latest_checkpoint}")
-        else:
-            rank0_print(f"Global step directory: {global_step_dirs[0]}")
-            
-        if not trainer_state_file.exists():
-            rank0_print(f"WARNING: No trainer_state.json found in {latest_checkpoint}")
-        else:
-            # Read and verify trainer state
-            with open(trainer_state_file, 'r') as f:
-                trainer_state = json.load(f)
-                rank0_print(f"Trainer state global_step: {trainer_state.get('global_step', 'UNKNOWN')}")
-                rank0_print(f"Trainer state epoch: {trainer_state.get('epoch', 'UNKNOWN')}")
-        
-        # Try to resume with full state first
         try:
-            rank0_print("Attempting to load checkpoint...")
-            rank0_print("NOTE: DeepSpeed optimizer state loading is buggy - using warm restart strategy")
-            trainer.train(resume_from_checkpoint=str(latest_checkpoint))
+            trainer.train(resume_from_checkpoint=checkpoint_to_resume)
         except Exception as e:
-            rank0_print(f"ERROR during checkpoint loading: {e}")
-            
             if ("world size" in str(e).lower() or 
                 "dp world size" in str(e).lower() or
                 "partition" in str(e).lower()):
+                
+                rank0_print("\n" + "="*20 + " WARM RESTART " + "="*20)
                 rank0_print(f"DeepSpeed world size/partition mismatch detected: {e}")
-                rank0_print("Attempting fallback: Loading model weights only (WITHOUT optimizer state)...")
+                rank0_print("Fallback: Starting training with loaded model weights but a fresh optimizer state.")
+                rank0_print("WARNING: Optimizer state NOT loaded - this may temporarily increase loss.")
+                rank0_print("To resume optimizer state, use the same GPU count as the original run.")
                 
-                # Load model weights manually
-                model_path = latest_checkpoint / "pytorch_model.bin"
-                if not model_path.exists():
-                    # Try safetensors format
-                    import glob
-                    safetensor_files = glob.glob(str(latest_checkpoint / "model*.safetensors"))
-                    if safetensor_files:
-                        rank0_print("Loading from safetensors format")
-                        from safetensors.torch import load_file
-                        state_dict = {}
-                        for file in safetensor_files:
-                            state_dict.update(load_file(file))
-                        model.load_state_dict(state_dict, strict=False)
-                        rank0_print("Model weights loaded successfully (NO optimizer state)")
-                    else:
-                        rank0_print("ERROR: No model files found in checkpoint!")
-                        raise ValueError(f"No model files found in {latest_checkpoint}")
-                
-                # Warn about loss implications
-                rank0_print("WARNING: Optimizer state NOT loaded - expect higher initial loss!")
-                rank0_print("Consider using same GPU count or converting checkpoint first.")
-                
-                # Start fresh training (no resume)
+                # Model weights are already loaded from the checkpoint, so we can start training
                 trainer.train()
             else:
-                # Re-raise if it's a different error
-                rank0_print(f"Unknown error during checkpoint loading: {e}")
+                rank0_print(f"\nUnknown error during checkpoint loading: {e}")
                 raise e
     else:
         rank0_print("No checkpoint found - starting fresh training")

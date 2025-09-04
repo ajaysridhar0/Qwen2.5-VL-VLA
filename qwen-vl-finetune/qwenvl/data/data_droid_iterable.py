@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 project_root = Path(__file__).parent.parent.parent.parent
 sys.path.append(str(project_root))
-from droid_rlds_dataset_iterable import DroidRldsDatasetIterable, DroidActionSpace
+from droid_rlds_dataset_iterable import DroidRldsDatasetStateful, DroidActionSpace
 
 # Import rope position embedding functions
 from .rope2d import get_rope_index_25, get_rope_index_2
@@ -69,6 +69,9 @@ class DroidVLADatasetIterable(IterableDataset):
         model_max_length: int = 2048,
         token_mappings: Dict = None,
         shuffle_buffer_size_override: int = None,
+        data_size: int = None,
+        samples_to_skip: int = 0,
+        seed: int = 42,
     ):
         super().__init__()
         
@@ -80,6 +83,9 @@ class DroidVLADatasetIterable(IterableDataset):
         self.token_mappings = token_mappings
         self.image_processor = data_args.image_processor
         self.shuffle_buffer_size_override = shuffle_buffer_size_override
+        self.data_size = data_size
+        self.samples_to_skip = samples_to_skip
+        self.seed = seed
         # Set up rope index function based on model type
         if hasattr(data_args, 'model_type') and data_args.model_type == "qwen2.5vl":
             self.get_rope_index = get_rope_index_25
@@ -104,27 +110,23 @@ class DroidVLADatasetIterable(IterableDataset):
         # This is critical for multi-worker loading.
         # It ensures each worker gets its own independent data stream.
         shuffle_buffer_size = self.shuffle_buffer_size_override if self.shuffle_buffer_size_override is not None else getattr(self.data_args, 'shuffle_buffer_size', 100000)
-        base_droid_dataset = DroidRldsDatasetIterable(
+        base_droid_dataset = DroidRldsDatasetStateful(
             data_dir=self.data_args.droid_data_dir,
             dataset_name=getattr(self.data_args, 'droid_dataset_name', 'droid_100'),
             batch_size=1, # Or 1 if you process one by one
             action_chunk_size=getattr(self.data_args, 'action_chunk_size', 15),
             action_space=DroidActionSpace.JOINT_VELOCITY if getattr(self.data_args, 'use_joint_velocity', True) else DroidActionSpace.JOINT_POSITION,
             shuffle_buffer_size=shuffle_buffer_size,
+            data_size=self.data_size,
+            samples_to_skip=self.samples_to_skip,
+            seed=self.seed,
         )
-        rank0_print(f"Shuffle buffer size: {shuffle_buffer_size}")
+        rank0_print(f"Shuffle buffer size potato: {shuffle_buffer_size}")
 
         # 2. Loop through the base dataset and apply your processing logic.
         base_droid_iterator = iter(base_droid_dataset)
         for batch in base_droid_iterator:
             # --- All the logic from your old __getitem__ goes here ---
-            try:
-                # Get next batch from DROID dataset
-                batch = next(base_droid_iterator)
-            except StopIteration:
-                # Reinitialize iterator if exhausted
-                base_droid_iterator = iter(base_droid_dataset)
-                batch = next(base_droid_iterator)
             
             # Extract data from batch (assuming batch size is 1 from the source)
             image = self._process_image(batch['observation']['image'][0])
@@ -266,111 +268,3 @@ class DroidVLADatasetIterable(IterableDataset):
                 "image_grid_thw": image_grid_thw,
             }
 
-
-# @dataclass
-# class DroidDataCollator:
-#     """Data collator for DROID VLA training."""
-    
-#     tokenizer: transformers.PreTrainedTokenizer
-    
-#     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-#         # Extract all fields
-#         input_ids = [instance["input_ids"] for instance in instances]
-#         labels = [instance["labels"] for instance in instances]
-#         position_ids = [instance["position_ids"] for instance in instances]
-        
-#         # Pad sequences
-#         input_ids = torch.nn.utils.rnn.pad_sequence(
-#             input_ids,
-#             batch_first=True,
-#             padding_value=self.tokenizer.pad_token_id
-#         )
-#         labels = torch.nn.utils.rnn.pad_sequence(
-#             labels,
-#             batch_first=True,
-#             padding_value=-100
-#         )
-        
-#         # Handle position_ids padding using the same approach as mixed VLA dataset
-#         from .data_qwen import pad_and_cat
-#         position_ids = pad_and_cat(position_ids)
-
-#         input_ids = input_ids[:, : self.tokenizer.model_max_length]
-#         labels = labels[:, : self.tokenizer.model_max_length]
-#         position_ids = position_ids[:, : self.tokenizer.model_max_length]
-        
-#         # # Ensure position_ids matches the sequence length of input_ids
-#         # seq_len = input_ids.shape[1]
-#         # if position_ids.shape[2] > seq_len:
-#         #     # Truncate to match input_ids sequence length
-#         #     position_ids = position_ids[:, :, :seq_len]
-#         # elif position_ids.shape[2] < seq_len:
-#         #     # Pad to match input_ids sequence length
-#         #     pad_size = seq_len - position_ids.shape[2]
-#         #     position_ids = torch.nn.functional.pad(position_ids, (0, pad_size), "constant", 1)
-        
-#         # Concatenate pixel values and image_grid_thw for multi-image input
-#         pixel_values = torch.cat([instance["pixel_values"] for instance in instances], dim=0)
-#         image_grid_thw = torch.cat([torch.as_tensor(instance["image_grid_thw"]) for instance in instances], dim=0)
-        
-#         # Create attention mask
-#         attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
-        
-#         return {
-#             "input_ids": input_ids,
-#             "labels": labels,
-#             "position_ids": position_ids,
-#             "attention_mask": attention_mask,
-#             "pixel_values": pixel_values,
-#             "image_grid_thw": image_grid_thw,
-#         }
-
-
-# def make_droid_data_module(
-#     tokenizer: transformers.PreTrainedTokenizer, 
-#     action_tokenizer,
-#     data_args,
-#     model_max_length: int,
-#     token_mappings: Dict = None,
-#     image_size: tuple = (180, 320),
-#     create_eval_dataset: bool = True,
-# ) -> Dict:
-#     """Make dataset and collator for DROID VLA fine-tuning."""
-    
-#     # Add DROID-specific args if not present
-#     if not hasattr(data_args, 'droid_data_dir'):
-#         data_args.droid_data_dir = "/iliad2/u/ajaysri/episodic_memory/droid_rlds"
-    
-#     train_dataset = DroidVLADataset(
-#         tokenizer=tokenizer,
-#         action_tokenizer=action_tokenizer,
-#         data_args=data_args,
-#         model_max_length=model_max_length,
-#         token_mappings=token_mappings,
-#         image_size=image_size,
-#     )
-    
-#     # Create a small eval dataset using the same dataset class
-#     eval_dataset = None
-#     if create_eval_dataset:
-#         eval_dataset = DroidVLADataset(
-#             tokenizer=tokenizer,
-#             action_tokenizer=action_tokenizer,
-#             data_args=data_args,
-#             model_max_length=model_max_length,
-#             token_mappings=token_mappings,
-#             image_size=image_size,
-#         )
-#         # Simple: always 100 examples for eval
-#         eval_size = 100
-#         eval_dataset.__len__ = lambda: eval_size
-#         eval_dataset.total_size = eval_size
-#         print(f"Eval dataset configured: VLA-only={eval_size}")
-    
-#     data_collator = DroidDataCollator(tokenizer=tokenizer)
-    
-#     return dict(
-#         train_dataset=train_dataset,
-#         eval_dataset=eval_dataset,
-#         data_collator=data_collator
-#     )
