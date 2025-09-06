@@ -189,65 +189,6 @@ class ProportionalMixedVLAValDataset(IterableDataset):
             sample_count += 1
 
 
-def make_proportional_mixed_val_data_module(
-    tokenizer: transformers.PreTrainedTokenizer,
-    action_tokenizer,
-    data_args,
-    model_max_length: int,
-    token_mappings: Dict = None,
-    image_size: tuple = (180, 320),
-    cotrain_json_ratio: float = 0.2,
-    create_eval_dataset: bool = True,
-    samples_to_skip: int = 0,
-    seed: int = 42,
-    data_size: int = None,
-) -> Dict:
-    """Make dataset and collator for proportional mixed VLA + JSON co-training."""
-    data_collator = MixedVLADataCollator(
-        tokenizer=tokenizer,
-        model_max_length=model_max_length
-    )
-    json_data_size = None
-    if data_size is not None and 0 < cotrain_json_ratio < 1:
-        json_data_size = int(data_size * cotrain_json_ratio / (1 - cotrain_json_ratio) * 1.5)
-        rank0_print(f"JSON dataset will be limited to {json_data_size} samples")
-    elif data_size is not None and cotrain_json_ratio >= 1:
-        json_data_size = data_size
-        rank0_print(f"JSON-only dataset will be limited to {json_data_size} samples")
-
-    json_dataset = JSONCotrainDataset(
-        tokenizer=tokenizer,
-        data_args=data_args,
-        model_max_length=model_max_length,
-        token_mappings=token_mappings,
-        image_size=image_size,
-        data_size=json_data_size,
-    ) if cotrain_json_ratio > 0 else None
-
-    vla_dataset_args = {
-        "tokenizer": tokenizer,
-        "data_args": data_args,
-        "action_tokenizer": action_tokenizer,
-        "model_max_length": model_max_length,
-        "token_mappings": token_mappings,
-    } if cotrain_json_ratio < 1 else None
-    
-    train_dataset = ProportionalMixedVLAValDataset(
-        json_dataset=json_dataset,
-        vla_dataset_args=vla_dataset_args,
-        json_ratio=cotrain_json_ratio,
-        data_size=data_size,
-        samples_to_skip=samples_to_skip,
-        seed=seed,
-    )
-    
-    return dict(
-        train_dataset=train_dataset,
-        eval_dataset=None,
-        data_collator=data_collator,
-        train_sampler_params=None,
-    )
-
 
 def make_proportional_mixed_val_data_module(
     tokenizer: transformers.PreTrainedTokenizer,
