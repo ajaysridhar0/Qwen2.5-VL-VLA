@@ -202,38 +202,6 @@ class DroidRldsDatasetStateful(IterableDataset):
                 "step_id": step_id,
                 "passes_filter": passes_filter,
             }
-        
-        # def restructure(traj):
-        #     actions = tf.concat(
-        #         (
-        #             (
-        #                 traj["action_dict"]["joint_position"]
-        #                 if self.action_space == DroidActionSpace.JOINT_POSITION
-        #                 else traj["action_dict"]["joint_velocity"]
-        #             ),
-        #             traj["action_dict"]["gripper_position"],
-        #         ),
-        #         axis=-1,
-        #     )
-        #     exterior_img = tf.cond(
-        #         tf.random.uniform(shape=[]) > 0.5,
-        #         lambda: traj["observation"]["exterior_image_1_left"],
-        #         lambda: traj["observation"]["exterior_image_2_left"],
-        #     )
-        #     wrist_img = traj["observation"]["wrist_image_left"]
-        #     instruction = tf.random.shuffle(
-        #         [traj["language_instruction"], traj["language_instruction_2"], traj["language_instruction_3"]]
-        #     )[0]
-        #     return {
-        #         "actions": actions,
-        #         "observation": {
-        #             "image": exterior_img,
-        #             "wrist_image": wrist_img,
-        #             "joint_position": traj["observation"]["joint_position"],
-        #             "gripper_position": traj["observation"]["gripper_position"],
-        #         },
-        #         "prompt": instruction,
-        #     }
 
         dataset = dataset.traj_map(restructure, self.num_parallel_calls)
         

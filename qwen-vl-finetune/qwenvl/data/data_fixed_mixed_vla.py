@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from typing import Dict, Sequence, List, Optional, Any, Union
 from PIL import Image
 from decord import VideoReader
-from torchcodec.decoders import VideoDecoder
 import os
 
 # Import existing components

@@ -94,6 +94,101 @@ class CheckpointProcessorCallback(TrainerCallback):
 
 
 
+# TODO: This callback is most likely buggy
+class DeepSpeedOptimizerStateCheckCallback(TrainerCallback):
+    """Callback to check if DeepSpeed optimizer state was loaded correctly."""
+
+    def __init__(self, trainer_ref=None, checkpoint_path=None):
+        self._checked = False
+        self.trainer_ref = trainer_ref
+        self.checkpoint_path = checkpoint_path
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        """Check optimizer state after training initialization but before first step"""
+        if not self._checked and state.is_world_process_zero:
+            trainer = self.trainer_ref()  # Get trainer from reference
+            if trainer is None:
+                rank0_print("⚠️  DeepSpeed Check: Trainer instance not found, skipping optimizer check.")
+                self._checked = True
+                return
+            
+            # Note: Since we're using resume_from_checkpoint=True and the checkpoint is in output_dir,
+            # the Trainer should have already loaded the checkpoint during initialization.
+            # This callback is now mainly for verification.
+            
+            # Now check the optimizer state
+            rank0_print("\n" + "="*20 + " DEEPSPEED OPTIMIZER STATE CHECK " + "="*20)
+            has_deepspeed = hasattr(trainer, 'deepspeed') and trainer.deepspeed is not None
+            rank0_print(f"  DeepSpeed Enabled: {has_deepspeed}")
+            
+            if has_deepspeed and hasattr(trainer.deepspeed, 'optimizer'):
+                optimizer_state = trainer.deepspeed.optimizer.state_dict().get('state', {})
+                if optimizer_state:
+                    first_param_state = next(iter(optimizer_state.values()), {})
+                    step = first_param_state.get('step', 0)
+                    has_momentum = 'exp_avg' in first_param_state
+                    rank0_print(f"  Optimizer Step Count: {step}")
+                    rank0_print(f"  Optimizer Has Momentum: {has_momentum}")
+                    if step > 0:
+                        rank0_print("  ✅ Optimizer state appears loaded correctly.")
+                    else:
+                        rank0_print("  ⚠️  WARNING: Optimizer step is 0. State may not be loaded.")
+                else:
+                    rank0_print("  ❌ ERROR: DeepSpeed optimizer state is empty!")
+                    rank0_print("  ℹ️  This usually means the checkpoint wasn't loaded properly during trainer.train()")
+                    rank0_print("  ℹ️  DeepSpeed should handle optimizer state loading automatically when resuming from checkpoint.")
+                    
+                    # Just verify the checkpoint structure exists
+                    if self.checkpoint_path:
+                        checkpoint_path = self.checkpoint_path
+                        step_num = checkpoint_path.split('-')[-1]
+                        
+                        # Check for the standard DeepSpeed checkpoint structure
+                        deepspeed_checkpoint_path = os.path.join(checkpoint_path, f"global_step{step_num}")
+                        
+                        rank0_print(f"  📁 Checking checkpoint structure at: {checkpoint_path}")
+                        rank0_print(f"  📁 DeepSpeed path should be: {deepspeed_checkpoint_path}")
+                        rank0_print(f"  📁 Path exists: {os.path.exists(deepspeed_checkpoint_path)}")
+                            
+                        if os.path.exists(deepspeed_checkpoint_path):
+                            # Verify latest file exists (required by DeepSpeed)
+                            latest_path = os.path.join(checkpoint_path, "latest")
+                            if not os.path.exists(latest_path):
+                                try:
+                                    with open(latest_path, 'w') as f:
+                                        f.write(f"global_step{step_num}")
+                                    rank0_print(f"  ✅ Created missing 'latest' file pointing to global_step{step_num}")
+                                except Exception as e:
+                                    rank0_print(f"  ⚠️  Could not create 'latest' file: {e}")
+                            else:
+                                with open(latest_path, 'r') as f:
+                                    content = f.read().strip()
+                                    rank0_print(f"  ✅ 'latest' file exists and points to: {content}")
+                            
+                            # List checkpoint contents for debugging
+                            try:
+                                files = sorted(os.listdir(deepspeed_checkpoint_path))
+                                rank0_print(f"  📁 Checkpoint contains: {', '.join(files[:5])}{'...' if len(files) > 5 else ''}")
+                            except Exception as e:
+                                rank0_print(f"  ⚠️  Could not list checkpoint contents: {e}")
+                            
+                            # The optimizer state is empty even though the checkpoint exists
+                            # This is a known issue with DeepSpeed + HuggingFace Trainer integration
+                            rank0_print("\n  💡 POTENTIAL ISSUES:")
+                            rank0_print("     1. The explicit DeepSpeed checkpoint loading before trainer.train() should have loaded it")
+                            rank0_print("     2. If that failed, check the logs above for the 'LOADING DEEPSPEED CHECKPOINT' section")
+                            rank0_print("     3. The optimizer state might be loaded but not visible in state_dict() yet")
+                            rank0_print("\n  ℹ️  The checkpoint structure looks correct. The issue is with the loading process.")
+                        else:
+                            rank0_print(f"  ❌ DeepSpeed checkpoint structure NOT found at expected path: {deepspeed_checkpoint_path}")
+                            rank0_print(f"  ℹ️  This checkpoint may not be a valid DeepSpeed checkpoint.")
+                            
+            elif has_deepspeed:
+                rank0_print("  ❌ ERROR: DeepSpeed is enabled, but no optimizer was found.")
+            rank0_print("="*61 + "\n")
+            self._checked = True
+
+
 import random
 
 class BatchShuffleWrapper:
@@ -218,6 +313,10 @@ class VLATrainer(Trainer):
         self._json_loss_count = 0
         self._log_interval = self.args.logging_steps  # Sync with Trainer's logging steps
         
+        # Initialize action accuracy tracking
+        self._action_accuracy_sum = 0.0
+        self._action_accuracy_count = 0
+        
         # Generation logging setup
         self.generation_logger = generation_logger
         self.generation_interval = generation_interval
@@ -228,6 +327,7 @@ class VLATrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """
         Override compute_loss to track separate losses for droid and JSON data.
+        Also compute action token accuracy for VLA training.
         
         We identify data types by checking for action tokens in the input_ids.
         """
@@ -235,22 +335,28 @@ class VLATrainer(Trainer):
         outputs = model(**inputs)
         loss = outputs.loss if isinstance(outputs, dict) else outputs[0]
         
-        # Check if we have action tokens to identify droid data
+        # Check if we have action tokens to identify droid data and compute accuracy
         if hasattr(self, 'action_start_id') and self.action_start_id is not None:
-            # Get input_ids from the batch
+            # Get input_ids and labels from the batch
             input_ids = inputs.get("input_ids", None)
+            labels = inputs.get("labels", None)
             
-            if input_ids is not None:
+            if input_ids is not None and labels is not None:
                 # Check each sample in the batch
                 batch_size = input_ids.shape[0]
+                
+                # Get logits for action token accuracy computation
+                logits = outputs.logits
+                
+                # Compute action token accuracy for droid samples
+                action_accuracy_sum = 0.0
+                action_accuracy_count = 0
                 
                 # Compute per-sample loss if not already done
                 if batch_size > 1:
                     # We need to compute per-sample loss to track separately
-                    labels = inputs.get("labels", None)
                     if labels is not None:
                         # Get logits and shift for loss computation
-                        logits = outputs.logits
                         shift_logits = logits[..., :-1, :].contiguous()
                         shift_labels = labels[..., 1:].contiguous()
                         
@@ -268,7 +374,7 @@ class VLATrainer(Trainer):
                         valid_tokens = (shift_labels != -100).float()
                         per_sample_loss = (per_token_loss * valid_tokens).sum(dim=1) / valid_tokens.sum(dim=1).clamp(min=1)
                         
-                        # Track losses based on data type
+                        # Track losses and accuracy based on data type
                         for i in range(batch_size):
                             sample_loss = per_sample_loss[i].item()
                             # Check if this sample has action tokens (droid data)
@@ -277,6 +383,14 @@ class VLATrainer(Trainer):
                             if has_action_tokens:
                                 self._droid_loss_sum += sample_loss
                                 self._droid_loss_count += 1
+                                
+                                # Compute action token accuracy for this sample
+                                sample_accuracy = self._compute_action_accuracy_for_sample(
+                                    logits[i:i+1], labels[i:i+1]
+                                )
+                                if sample_accuracy is not None:
+                                    action_accuracy_sum += sample_accuracy
+                                    action_accuracy_count += 1
                             else:
                                 self._json_loss_sum += sample_loss
                                 self._json_loss_count += 1
@@ -288,9 +402,24 @@ class VLATrainer(Trainer):
                     if has_action_tokens:
                         self._droid_loss_sum += loss_value
                         self._droid_loss_count += 1
+                        
+                        # Compute action token accuracy for this sample
+                        sample_accuracy = self._compute_action_accuracy_for_sample(logits, labels)
+                        if sample_accuracy is not None:
+                            action_accuracy_sum += sample_accuracy
+                            action_accuracy_count += 1
                     else:
                         self._json_loss_sum += loss_value
                         self._json_loss_count += 1
+                
+                # Track action accuracy
+                if action_accuracy_count > 0:
+                    avg_action_accuracy = action_accuracy_sum / action_accuracy_count
+                    if not hasattr(self, '_action_accuracy_sum'):
+                        self._action_accuracy_sum = 0.0
+                        self._action_accuracy_count = 0
+                    self._action_accuracy_sum += avg_action_accuracy
+                    self._action_accuracy_count += 1
         
         # Log separate losses periodically
         if self.state.global_step > 0 and self.state.global_step % self._log_interval == 0:
@@ -307,6 +436,49 @@ class VLATrainer(Trainer):
             self._run_generation_logging(inputs)
         
         return (loss, outputs) if return_outputs else loss
+    
+    def _compute_action_accuracy_for_sample(self, logits, labels):
+        """
+        Compute action token accuracy for a single sample.
+        Based on the code provided by the user.
+        """
+        try:
+            # Get action token IDs range from token mappings
+            if not hasattr(self, 'action_token_begin_idx'):
+                if hasattr(self, 'token_mappings') and 'action_token_ids' in self.token_mappings:
+                    # Use actual token mappings
+                    self.action_token_begin_idx = min(self.token_mappings['action_token_ids'])
+                    self.action_token_end_idx = max(self.token_mappings['action_token_ids'])
+                else:
+                    # Fallback to default range
+                    action_token_start = 148256  # Default action token start
+                    action_vocab_size = 1024    # Default action vocab size
+                    self.action_token_begin_idx = action_token_start
+                    self.action_token_end_idx = action_token_start + action_vocab_size - 1
+            
+            # Get predictions from logits (equivalent to: action_preds = output.logits[:, self.vlm.vision_backbone.num_patches : -1].argmax(dim=2))
+            # For Qwen VLA, we need to identify where action tokens are in the sequence
+            # We'll use the full sequence and filter by action token range
+            action_preds = logits[:, :-1].argmax(dim=2)  # [batch, seq_len-1]
+            action_gt = labels[:, 1:]  # [batch, seq_len-1]
+            
+            # Create mask for action tokens (equivalent to: mask = (action_tokenizer.action_token_end_idx > action_gt) & (action_gt > action_tokenizer.action_token_begin_idx))
+            mask = (action_gt >= self.action_token_begin_idx) & (action_gt <= self.action_token_end_idx) & (action_gt != -100)
+            
+            if mask.sum() == 0:
+                # No action tokens in this sample
+                return None
+            
+            # Compute accuracy (equivalent to: correct_preds = (action_preds == action_gt) & mask; action_accuracy = correct_preds.sum().float() / mask.sum().float())
+            correct_preds = (action_preds == action_gt) & mask
+            action_accuracy = correct_preds.sum().float() / mask.sum().float()
+            
+            return action_accuracy.item()
+            
+        except Exception as e:
+            # If there's any error in accuracy computation, don't crash training
+            print(f"Warning: Error computing action accuracy: {e}")
+            return None
     
     def _run_generation_logging(self, current_batch):
         """Run generation logging using the current batch as a sample. Only called on rank 0."""
@@ -327,7 +499,7 @@ class VLATrainer(Trainer):
             traceback.print_exc()
 
     def _log_separate_losses(self):
-        """Log separate losses to wandb and console."""
+        """Log separate losses and action accuracy to wandb and console."""
         metrics = {}
         
         # Calculate average droid loss
@@ -346,6 +518,14 @@ class VLATrainer(Trainer):
             self._json_loss_sum = 0.0
             self._json_loss_count = 0
         
+        # Calculate average action accuracy
+        if hasattr(self, '_action_accuracy_count') and self._action_accuracy_count > 0:
+            avg_action_accuracy = self._action_accuracy_sum / self._action_accuracy_count
+            metrics["train/action_accuracy"] = avg_action_accuracy
+            # Reset counters
+            self._action_accuracy_sum = 0.0
+            self._action_accuracy_count = 0
+        
         # Log to wandb if available (only on rank 0)
         if len(metrics) > 0 and self.args.local_rank in [-1, 0]:
             self.log(metrics)
@@ -355,12 +535,15 @@ class VLATrainer(Trainer):
             if "train/droid_loss" in metrics:
                 log_str += f"droid_loss={metrics['train/droid_loss']:.4f} "
             if "train/json_loss" in metrics:
-                log_str += f"json_loss={metrics['train/json_loss']:.4f}"
+                log_str += f"json_loss={metrics['train/json_loss']:.4f} "
+            if "train/action_accuracy" in metrics:
+                log_str += f"action_accuracy={metrics['train/action_accuracy']:.4f}"
             rank0_print(log_str)
     
     def on_train_end(self, args, state, control, **kwargs):
-        """Log any remaining losses at the end of training."""
-        if self._droid_loss_count > 0 or self._json_loss_count > 0:
+        """Log any remaining losses and action accuracy at the end of training."""
+        if (self._droid_loss_count > 0 or self._json_loss_count > 0 or 
+            (hasattr(self, '_action_accuracy_count') and self._action_accuracy_count > 0)):
             self._log_separate_losses()
         return super().on_train_end(args, state, control, **kwargs)
 
@@ -549,6 +732,18 @@ def get_action_state_token_mappings(tokenizer, action_vocab_size=1024, state_voc
     }
 
 
+def get_sorted_checkpoints(output_dir):
+    """Get checkpoints sorted from latest to oldest."""
+    checkpoint_dirs = list(pathlib.Path(output_dir).glob("checkpoint-*"))
+    if checkpoint_dirs:
+        regular_checkpoints = [d for d in checkpoint_dirs if not d.name.endswith('_fixed')]
+        if regular_checkpoints:
+            # Sort by checkpoint step number (latest first)
+            sorted_checkpoints = sorted(regular_checkpoints, key=lambda x: int(x.name.split('-')[1]), reverse=True)
+            return [str(cp) for cp in sorted_checkpoints]
+    return []
+
+
 def train(attn_implementation="flash_attention_2"):
     global local_rank
 
@@ -560,32 +755,75 @@ def train(attn_implementation="flash_attention_2"):
     local_rank = training_args.local_rank
     os.makedirs(training_args.output_dir, exist_ok=True)
 
-    # Determine model load path and checkpoint for resuming
+    # Determine available checkpoints for resuming
+    available_checkpoints = get_sorted_checkpoints(training_args.output_dir)
     checkpoint_to_resume = None
-    model_load_path = model_args.model_name_or_path
     
-    checkpoint_dirs = list(pathlib.Path(training_args.output_dir).glob("checkpoint-*"))
-    if checkpoint_dirs:
-        regular_checkpoints = [d for d in checkpoint_dirs if not d.name.endswith('_fixed')]
-        if regular_checkpoints:
-            latest_checkpoint = max(regular_checkpoints, key=lambda x: int(x.name.split('-')[1]))
-            rank0_print(f"Found latest checkpoint: {latest_checkpoint}")
-            model_load_path = str(latest_checkpoint)
-            checkpoint_to_resume = str(latest_checkpoint)
+    
+    if available_checkpoints:
+        latest_checkpoint = available_checkpoints[0]
+        rank0_print(f"Found {len(available_checkpoints)} checkpoint(s). Latest: {latest_checkpoint}")
+        if len(available_checkpoints) > 1:
+            rank0_print(f"Second latest checkpoint available: {available_checkpoints[1]}")
+        # Load model from the latest checkpoint initially - if it fails during training,
+        # we'll try other checkpoints during the training phase
+        checkpoint_to_resume = latest_checkpoint
 
-    # Load model
+    # Load model with checkpoint fallback
     # Check original model name for 'qwen2.5' as checkpoint path might not contain it
     if "qwen2.5" in model_args.model_name_or_path.lower():
-        # Use base model directly since we're only using existing tokens
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            model_load_path,
-            cache_dir=training_args.cache_dir,
-            attn_implementation=attn_implementation,
-            torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-        )
-        data_args.image_processor = AutoProcessor.from_pretrained(
-            model_load_path, trust_remote_code=True
-        ).image_processor
+        model = None
+        image_processor = None
+        
+        # Try loading model from available checkpoints, fallback to base model
+        model_load_paths_to_try = []
+        if available_checkpoints:
+            model_load_paths_to_try.extend(available_checkpoints)
+        model_load_paths_to_try.append(model_args.model_name_or_path)  # Fallback to base model
+        
+        for i, load_path in enumerate(model_load_paths_to_try):
+            try:
+                if i == 0 and available_checkpoints:
+                    rank0_print(f"Loading model from latest checkpoint: {load_path}")
+                elif i > 0 and i < len(available_checkpoints):
+                    rank0_print(f"Loading model from checkpoint #{i+1}: {load_path}")
+                else:
+                    rank0_print(f"Loading base model: {load_path}")
+                
+                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    load_path,
+                    cache_dir=training_args.cache_dir,
+                    attn_implementation=attn_implementation,
+                    torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+                )
+                image_processor = AutoProcessor.from_pretrained(
+                    load_path, trust_remote_code=True
+                ).image_processor
+                
+                # Update the actual model load path used and checkpoint info
+                if load_path in available_checkpoints:
+                    checkpoint_to_resume = load_path
+                else:
+                    # We loaded from base model, no checkpoint to resume
+                    checkpoint_to_resume = None
+                    available_checkpoints = []  # Clear since we're starting fresh
+                
+                rank0_print(f"Successfully loaded model from: {load_path}")
+                break
+                
+            except Exception as e:
+                rank0_print(f"Failed to load model from {load_path}: {e}")
+                if i < len(model_load_paths_to_try) - 1:
+                    rank0_print("Trying next checkpoint...")
+                    continue
+                else:
+                    rank0_print("All model loading attempts failed")
+                    raise e
+        
+        if model is None or image_processor is None:
+            raise RuntimeError("Failed to load model from any checkpoint or base model")
+            
+        data_args.image_processor = image_processor
         data_args.model_type = "qwen2.5vl"
     else:
         raise NotImplementedError("Only Qwen2.5-VL is supported for VLA training")
@@ -639,41 +877,7 @@ def train(attn_implementation="flash_attention_2"):
         rank0_print(f"Language model trainable: {model_args.tune_mm_llm}")
         rank0_print(f"Action vocabulary size: {action_vocab_size}")
     
-    # # # Create data module with token mappings
-    # if data_args.enable_cotrain and data_args.cotrain_json_paths:
-    #     # Parse comma-separated JSON paths
-    #     json_paths = [path.strip() for path in data_args.cotrain_json_paths.split(",") if path.strip()]
-    #     data_args.cotrain_json_paths = json_paths
-        
-    #     rank0_print(f"Co-training enabled with {len(json_paths)} JSON datasets")
-    #     rank0_print(f"JSON ratio: {data_args.cotrain_json_ratio:.2f}")
-    #     rank0_print(f"JSON paths: {json_paths}")
-    #     rank0_print(f"Image resize constraints: max_dim={data_args.max_image_dim}, min_dim={data_args.min_image_dim}")
-    #     rank0_print(f"Pixel budget: {data_args.pixel_budget:,} pixels per JSON query (VLA data unchanged)")
-        
-    #     data_module = make_mixed_vla_data_module(
-    #         tokenizer=tokenizer,
-    #         action_tokenizer=action_tokenizer,
-    #         data_args=data_args,
-    #         model_max_length=training_args.model_max_length,
-    #         token_mappings=token_mappings,
-    #         image_size=(data_args.image_height, data_args.image_width),
-    #         cotrain_json_ratio=data_args.cotrain_json_ratio,
-    #         use_fixed_ratio_sampler=data_args.use_fixed_ratio_sampler,
-    #     )
-    # else:
-    #     # Standard VLA-only training
-    #     rank0_print("VLA-only training (no co-training)")
-    #     rank0_print(f"Image resize constraints: max_dim={data_args.max_image_dim}, min_dim={data_args.min_image_dim}")
-    #     rank0_print(f"Pixel budget: {data_args.pixel_budget:,} pixels per JSON query (VLA data unchanged)")
-    #     data_module = make_droid_data_module(
-    #         tokenizer=tokenizer, 
-    #         action_tokenizer=action_tokenizer,
-    #         data_args=data_args,
-    #         model_max_length=training_args.model_max_length,
-    #         token_mappings=token_mappings,
-    #         image_size=(data_args.image_height, data_args.image_width)
-    #     )
+
 
     # Use skip_samples from training arguments (user can set this manually)
     # If resuming and skip_samples is 0, we'll use step-based seeding instead of skipping
@@ -731,36 +935,74 @@ def train(attn_implementation="flash_attention_2"):
     # Extract sampler params if present
     train_sampler_params = data_module.pop('train_sampler_params', None)
     
+    # Ensure gradient accumulation consistency before creating trainer
+    rank0_print(f"Training args gradient_accumulation_steps: {training_args.gradient_accumulation_steps}")
+    
+    # Force gradient accumulation steps to be consistent
+    if hasattr(training_args, 'gradient_accumulation_steps') and training_args.gradient_accumulation_steps != 2:
+        rank0_print(f"WARNING: Forcing gradient_accumulation_steps from {training_args.gradient_accumulation_steps} to 2")
+        training_args.gradient_accumulation_steps = 2
+    
+    # For DeepSpeed, the checkpoint path should be set in training_args
+    # But we'll follow the simpler approach from train_qwen.py
+    
     # Initialize trainer with simplified generation logger
     
     trainer = VLATrainer(
         model=model, 
         processing_class=tokenizer, 
         args=training_args, 
-        callbacks=[checkpoint_processor_callback],  # Only keep checkpoint processor
+        callbacks=[checkpoint_processor_callback],  # Start with checkpoint processor only
         train_sampler_params=train_sampler_params,  # Pass sampler params to custom trainer
         generation_logger=generation_logger,  # Pass generation logger to trainer
         generation_interval=training_args.generation_interval,  # Use configurable generation interval
         **data_module
     )
     
+    # Add the optimizer state check callback after trainer creation
+    # Only add the callback if we're resuming from a checkpoint
+    if checkpoint_to_resume:
+        optimizer_check_callback = DeepSpeedOptimizerStateCheckCallback(
+            trainer_ref=lambda: trainer,
+            checkpoint_path=checkpoint_to_resume
+        )
+        trainer.add_callback(optimizer_check_callback)
+    
 
     
-    # Set action_start_id on trainer for loss separation
+    # Verify final gradient accumulation configuration
+    rank0_print(f"Final trainer gradient_accumulation_steps: {trainer.args.gradient_accumulation_steps}")
+    if hasattr(trainer, 'accelerator') and hasattr(trainer.accelerator, 'gradient_accumulation_steps'):
+        rank0_print(f"Accelerator gradient_accumulation_steps: {trainer.accelerator.gradient_accumulation_steps}")
+        
+        # Force accelerator to use the same value as trainer
+        if trainer.accelerator.gradient_accumulation_steps != trainer.args.gradient_accumulation_steps:
+            rank0_print(f"🔧 FIXING: Setting accelerator gradient_accumulation_steps from {trainer.accelerator.gradient_accumulation_steps} to {trainer.args.gradient_accumulation_steps}")
+            trainer.accelerator.gradient_accumulation_steps = trainer.args.gradient_accumulation_steps
+            rank0_print(f"✅ Fixed accelerator gradient_accumulation_steps: {trainer.accelerator.gradient_accumulation_steps}")
+    
+    # Set action_start_id and token mappings on trainer for loss separation and accuracy computation
     trainer.action_start_id = token_mappings['action_start_id']
+    trainer.token_mappings = token_mappings
     
     # TODO: Switch to EMATrainer when implementing custom EMA support
     # trainer_class = EMATrainer if getattr(training_args, 'use_ema', False) else Trainer
     # trainer = trainer_class(model=model, processing_class=tokenizer, args=training_args, **data_module)
 
-    # Start training
+    # Start training - use the simple approach since checkpoints are in output_dir
     if checkpoint_to_resume:
         rank0_print("="*20 + " CHECKPOINT RESUMPTION " + "="*20)
-        rank0_print(f"Attempting to resume full training state from: {checkpoint_to_resume}")
+        rank0_print(f"Found checkpoint in output directory: {checkpoint_to_resume}")
+        rank0_print("Using resume_from_checkpoint=True to let Trainer find the latest checkpoint")
         
         try:
-            trainer.train(resume_from_checkpoint=checkpoint_to_resume)
+            # Use the simple approach from train_qwen.py since checkpoint is in output_dir
+            trainer.train(resume_from_checkpoint=True)
+            
         except Exception as e:
+            rank0_print(f"Failed to resume from {checkpoint_to_resume}: {e}")
+            
+            # Handle known DeepSpeed world size issues with a warm restart
             if ("world size" in str(e).lower() or 
                 "dp world size" in str(e).lower() or
                 "partition" in str(e).lower()):
@@ -773,9 +1015,30 @@ def train(attn_implementation="flash_attention_2"):
                 
                 # Model weights are already loaded from the checkpoint, so we can start training
                 trainer.train()
+                
             else:
-                rank0_print(f"\nUnknown error during checkpoint loading: {e}")
-                raise e
+                # Try fallback checkpoints if available (only for training state, model is already loaded)
+                if len(available_checkpoints) > 1:
+                    rank0_print(f"Attempting fallback to other checkpoints for training state...")
+                    
+                    fallback_successful = False
+                    for i, fallback_checkpoint in enumerate(available_checkpoints[1:], 1):
+                        rank0_print(f"Trying checkpoint #{i+1}: {fallback_checkpoint}")
+                        try:
+                            trainer.train(resume_from_checkpoint=fallback_checkpoint)
+                            fallback_successful = True
+                            break
+                        except Exception as fallback_e:
+                            rank0_print(f"Fallback checkpoint {fallback_checkpoint} also failed: {fallback_e}")
+                            continue
+                    
+                    if not fallback_successful:
+                        rank0_print("All checkpoint resumption attempts failed. Starting fresh training with loaded model weights.")
+                        trainer.train()
+                else:
+                    rank0_print("No fallback checkpoints available. Starting fresh training with loaded model weights.")
+                    trainer.train()
+            
     else:
         rank0_print("No checkpoint found - starting fresh training")
         trainer.train()

@@ -38,7 +38,7 @@ def rank0_print(*args):
     else:
         print(*args)
 
-NORM_STATS = json.load(open("/iliad2/u/ajaysri/episodic_memory/Qwen2.5-VL-VLA/norm_stats.json"))
+NORM_STATS = json.load(open("./norm_stats.json"))
 
 def normalize_action(x, input_type="action"):
     q01 = np.array(NORM_STATS["norm_stats"][input_type]["q01"][:8])

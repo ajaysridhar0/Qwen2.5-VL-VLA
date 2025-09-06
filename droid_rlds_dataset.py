@@ -32,6 +32,9 @@ class DroidRldsDataset:
         shuffle_buffer_size: int = 250_000,
         num_parallel_reads: int = -1,  # -1 == tf.data.AUTOTUNE -- hack to not import tf at top level
         num_parallel_calls: int = -1,  # -1 == tf.data.AUTOTUNE -- hack to not import tf at top level
+        # GPU-level distributed training parameters
+        num_gpus: int = 1,
+        gpu_index: int = 0,
     ):
         # Import tensorflow here to not make it mandatory in case RLDS data loader is not used.
         import dlimp as dl
@@ -43,6 +46,11 @@ class DroidRldsDataset:
 
         builder = tfds.builder(dataset_name, data_dir=data_dir)
         dataset = dl.DLataset.from_rlds(builder, split="train", shuffle=shuffle, num_parallel_reads=num_parallel_reads)
+
+        # Apply GPU-level sharding for distributed training
+        if num_gpus > 1:
+            dataset = dataset.shard(num_gpus, gpu_index)
+            print(f"GPU {gpu_index}/{num_gpus}: Dataset sharded for distributed training")
 
         # Filter out any unsuccessful trajectories -- we use the file name to check this
         dataset = dataset.filter(
