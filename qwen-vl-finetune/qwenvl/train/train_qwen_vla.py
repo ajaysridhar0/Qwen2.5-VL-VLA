@@ -43,7 +43,7 @@ from transformers import (
 from qwenvl.data.data_droid import make_droid_data_module
 from qwenvl.data.data_mixed_vla import make_mixed_vla_data_module
 from qwenvl.data.data_fixed_mixed_vla import make_fixed_mixed_val_data_module
-from qwenvl.data.data_proportional_mixed_vla import make_proportional_mixed_val_data_module
+from qwenvl.data.data_proportional_mixed_vla import make_proportional_mixed_vla_data_module
 # from qwenvl.data.data_droid_iterable import make_droid_data_module_iterable
 
 from qwenvl.train.argument import (
@@ -910,7 +910,7 @@ def train(attn_implementation="flash_attention_2"):
         data_module = make_fixed_mixed_val_data_module(**dataset_creation_args)
     else:
         rank0_print("Using proportional mixed dataset with probabilistic sampling")
-        data_module = make_proportional_mixed_val_data_module(**dataset_creation_args)
+        data_module = make_proportional_mixed_vla_data_module(**dataset_creation_args)
     
     # Create simplified generation logger for use in compute_loss
     # The action tokenizer will be initialized through normal data loading

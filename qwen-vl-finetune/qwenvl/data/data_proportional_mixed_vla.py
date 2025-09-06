@@ -43,7 +43,7 @@ def rank0_print(*args):
         print(*args)
 
 
-class ProportionalMixedVLAValDataset(IterableDataset):
+class ProportionalMixedVLADataset(IterableDataset):
     """
     An IterableDataset that yields samples using proportional sampling from two different
     data sources (one map-style, one iterable). Instead of fixed batch ratios, each sample
@@ -190,7 +190,7 @@ class ProportionalMixedVLAValDataset(IterableDataset):
 
 
 
-def make_proportional_mixed_val_data_module(
+def make_proportional_mixed_vla_data_module(
     tokenizer: transformers.PreTrainedTokenizer,
     action_tokenizer,
     data_args,
@@ -246,7 +246,7 @@ def make_proportional_mixed_val_data_module(
         vla_dataset_args = None
     
     # Create train dataset with proportional sampling
-    train_dataset = ProportionalMixedVLAValDataset(
+    train_dataset = ProportionalMixedVLADataset(
         json_dataset=json_dataset,
         vla_dataset_args=vla_dataset_args,
         json_ratio=cotrain_json_ratio,
