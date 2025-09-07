@@ -1,7 +1,5 @@
 import torch
-import tensorflow as tf
-import tensorflow_datasets as tfds
-import dlimp as dl
+
 import time
 import json
 import logging
@@ -15,11 +13,14 @@ class DroidActionSpace(Enum):
     JOINT_POSITION = 1
     JOINT_VELOCITY = 2
 
-_shuffle_buffer_stats = {
+_shuffle_buffer_stats = { 
     'lock': __import__('threading').Lock(),
     'buffer_created_count': 0,
     'total_buffer_size': 0,
-    'worker_buffers': {}
+    'worker_buffers': {},
+    'worker_timings': {},
+    'buffer_memory_usage': {},
+    'samples_processed': {}
 }
 
 def rank0_print(*args):
@@ -29,6 +30,35 @@ def rank0_print(*args):
             print(*args)
     else:
         print(*args)
+
+def get_memory_usage_mb():
+    """Get current memory usage in MB."""
+    try:
+        import psutil
+        process = psutil.Process()
+        return process.memory_info().rss / (1024 * 1024)
+    except ImportError:
+        return 0.0
+
+def log_worker_stats():
+    """Log comprehensive worker statistics."""
+    with _shuffle_buffer_stats['lock']:
+        stats = _shuffle_buffer_stats
+        
+        rank0_print("\n=== WORKER STATISTICS ===")
+        rank0_print(f"Total buffers created: {stats['buffer_created_count']}")
+        rank0_print(f"Total buffer size: {stats['total_buffer_size']:,}")
+        
+        if stats['worker_buffers']:
+            rank0_print("Per-worker buffer sizes:")
+            for worker_id, buffer_size in stats['worker_buffers'].items():
+                timing = stats['worker_timings'].get(worker_id, 0)
+                memory = stats['buffer_memory_usage'].get(worker_id, 0)
+                samples = stats['samples_processed'].get(worker_id, 0)
+                rank0_print(f"  Worker {worker_id}: buffer={buffer_size:,}, "
+                          f"time={timing:.2f}s, memory={memory:.1f}MB, samples={samples:,}")
+        
+        rank0_print("=========================\n")
 
 class DroidRldsDatasetStateful(IterableDataset):
     def __init__(
@@ -66,36 +96,43 @@ class DroidRldsDatasetStateful(IterableDataset):
         self.filter_dict_path = filter_dict_path
         # We don't need the GPU-sharding parameters from the original class,
         # as PyTorch's DataLoader and our sharding logic will handle this.
-        #     # Initialize filter table in __init__ for efficiency
-        self._initialize_filter_table()
+        # Initialize filter dictionary (not TF table) in __init__ for efficiency
+        self._initialize_filter_dict()
 
-    def _initialize_filter_table(self):
-        """Initialize the filter table once in __init__ instead of per worker."""
+    def _initialize_filter_dict(self):
+        """Initialize the filter dictionary data in __init__ for efficiency."""
         if self.filter_dict_path is not None:
             cached_filter_dict_path = maybe_download(self.filter_dict_path)
             with Path(cached_filter_dict_path).open("r") as f:
-                filter_dict = json.load(f)
+                self.filter_dict = json.load(f)
+            print(f"Initializing filter dictionary with {len(self.filter_dict)} episodes")
+        else:
+            self.filter_dict = None
 
-            print(f"Initializing filter dictionary with {len(filter_dict)} episodes")
-
+    def _create_filter_table(self, tf):
+        """Create TensorFlow filter table from the loaded dictionary."""
+        if self.filter_dict is not None:
             keys_tensor = []
             values_tensor = []
 
-            for episode_key, ranges in tqdm.tqdm(filter_dict.items(), desc="Creating idle filter hash table..."):
+            for episode_key, ranges in tqdm.tqdm(self.filter_dict.items(), desc="Creating idle filter hash table..."):
                 for start, end in ranges:
                     for t in range(start, end):
                         frame_key = f"{episode_key}--{t}"
                         keys_tensor.append(frame_key)
                         values_tensor.append(True)
             
-            self.filter_table = tf.lookup.StaticHashTable(
+            filter_table = tf.lookup.StaticHashTable(
                 tf.lookup.KeyValueTensorInitializer(keys_tensor, values_tensor), default_value=False
             )
             print("Filter hash table initialized")
+            return filter_table
         else:
-            self.filter_table = tf.lookup.StaticHashTable(
+            return tf.lookup.StaticHashTable(
                 tf.lookup.KeyValueTensorInitializer([""], [True]), default_value=True
             )
+
+        
     
     def __iter__(self):
         """
@@ -122,9 +159,16 @@ class DroidRldsDatasetStateful(IterableDataset):
             gpu_rank = 0
             world_size = 1
 
+        import tensorflow as tf
+        import tensorflow_datasets as tfds
+        import dlimp as dl
+
         # 2. CONFIGURE TENSORFLOW FOR THE WORKER
         # Each worker needs its own TF configuration to avoid conflicts.
         tf.config.set_visible_devices([], "GPU")
+
+        # Create filter table after TF is configured
+        self.filter_table = self._create_filter_table(tf)
 
         # 3. BUILD THE TF.DATA PIPELINE (Copied from your original class)
         builder = tfds.builder(self.dataset_name, data_dir=self.data_dir)
@@ -297,13 +341,48 @@ class DroidRldsDatasetStateful(IterableDataset):
         shuffle_seed = self.seed + global_worker_id if self.seed is not None else None
 
         # Shuffle, batch, and finalize the pipeline
+        # Track buffer creation for profiling
+        buffer_start_time = time.time()
+        memory_before = get_memory_usage_mb()
+        
         dataset = dataset.shuffle(self.shuffle_buffer_size, seed=shuffle_seed)
         dataset = dataset.batch(self.batch_size)
         dataset = dataset.with_ram_budget(1)
+        
+        # Record buffer creation stats
+        buffer_time = time.time() - buffer_start_time
+        memory_after = get_memory_usage_mb()
+        memory_used = memory_after - memory_before
+        
+        with _shuffle_buffer_stats['lock']:
+            _shuffle_buffer_stats['buffer_created_count'] += 1
+            _shuffle_buffer_stats['total_buffer_size'] += self.shuffle_buffer_size
+            _shuffle_buffer_stats['worker_buffers'][global_worker_id] = self.shuffle_buffer_size
+            _shuffle_buffer_stats['worker_timings'][global_worker_id] = buffer_time
+            _shuffle_buffer_stats['buffer_memory_usage'][global_worker_id] = memory_used
+            _shuffle_buffer_stats['samples_processed'][global_worker_id] = 0
+        
+        rank0_print(f"Worker {global_worker_id}: shuffle buffer created in {buffer_time:.2f}s, "
+                   f"memory usage: {memory_used:.1f}MB")
 
         # 5. YIELD DATA FROM THE WORKER'S PIPELINE
         # Each worker will now yield batches from its own unique data shard.
-        yield from dataset.as_numpy_iterator()
+        sample_count = 0
+        batch_count = 0
+        
+        for batch in dataset.as_numpy_iterator():
+            batch_size = len(batch['observation']['image']) if isinstance(batch, dict) and 'observation' in batch else 1
+            sample_count += batch_size
+            batch_count += 1
+            
+            # Update sample count every 100 batches
+            if batch_count % 100 == 0:
+                with _shuffle_buffer_stats['lock']:
+                    _shuffle_buffer_stats['samples_processed'][global_worker_id] = sample_count
+                
+                rank0_print(f"Worker {global_worker_id}: processed {sample_count} samples in {batch_count} batches")
+            
+            yield batch
 
     def __len__(self):
         # As before, this is an approximation.

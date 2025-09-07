@@ -44,6 +44,7 @@ from qwenvl.data.data_droid import make_droid_data_module
 from qwenvl.data.data_mixed_vla import make_mixed_vla_data_module
 from qwenvl.data.data_fixed_mixed_vla import make_fixed_mixed_val_data_module
 from qwenvl.data.data_proportional_mixed_vla import make_proportional_mixed_vla_data_module
+from qwenvl.data.data_droid_iterable import make_droid_data_iterable_module
 # from qwenvl.data.data_droid_iterable import make_droid_data_module_iterable
 
 from qwenvl.train.argument import (
@@ -272,10 +273,18 @@ class VLATrainer(Trainer):
             data_collator = self._get_collator_with_removed_columns(data_collator, description="training")
 
         # We know our dataset is iterable, so we don't need a sampler
+        # For TensorFlow-based datasets, reduce num_workers to avoid overhead
+        num_workers = self.args.dataloader_num_workers
+        if hasattr(train_dataset, '__class__') and 'Droid' in train_dataset.__class__.__name__:
+            # Limit workers for TensorFlow datasets to avoid memory overhead
+            num_workers = min(num_workers, 4)  # Cap at 4 workers
+            if num_workers != self.args.dataloader_num_workers:
+                rank0_print(f"🔧 Reducing num_workers from {self.args.dataloader_num_workers} to {num_workers} for TensorFlow dataset")
+        
         dataloader_params = {
-            "batch_size": self._train_batch_size,
+            "batch_size": None if hasattr(train_dataset, '__class__') and 'Droid' in train_dataset.__class__.__name__ else self._train_batch_size,
             "collate_fn": data_collator,
-            "num_workers": self.args.dataloader_num_workers,
+            "num_workers": num_workers,
             "pin_memory": self.args.dataloader_pin_memory,
             "persistent_workers": self.args.dataloader_persistent_workers,
         }
@@ -287,6 +296,7 @@ class VLATrainer(Trainer):
             dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
 
         # 1. Create the standard DataLoader
+        
         dataloader = DataLoader(train_dataset, **dataloader_params)
 
         # # # # 2. Apply our custom batch shuffling wrapper
@@ -902,15 +912,21 @@ def train(attn_implementation="flash_attention_2"):
         'cotrain_json_ratio': data_args.cotrain_json_ratio,
         'samples_to_skip': training_args.skip_samples,  # Use explicit argument
         'seed': 42 + checkpoint_step,  # Use step-based seeding for randomness
+        'batch_size': training_args.per_device_train_batch_size,  # Pass correct batch size to dataset
     }
     
     # Choose dataset type based on data_args.dataset_type
     if data_args.dataset_type == "fixed":
-        rank0_print("Using fixed ratio mixed dataset with pre-collation")
-        data_module = make_fixed_mixed_val_data_module(**dataset_creation_args)
+        raise NotImplementedError("Fixed ratio mixed dataset with pre-collation is not supported")
+        # rank0_print("Using fixed ratio mixed dataset with pre-collation")
+        # data_module = make_fixed_mixed_val_data_module(**dataset_creation_args)
     else:
-        rank0_print("Using proportional mixed dataset with probabilistic sampling")
-        data_module = make_proportional_mixed_vla_data_module(**dataset_creation_args)
+        if data_args.cotrain_json_ratio > 0:
+            rank0_print("🦄 Using proportional mixed dataset with probabilistic sampling")
+            data_module = make_proportional_mixed_vla_data_module(**dataset_creation_args)
+        else:
+            rank0_print("🤖 Using VLA-only dataset")
+            data_module = make_droid_data_iterable_module(**dataset_creation_args)
     
     # Create simplified generation logger for use in compute_loss
     # The action tokenizer will be initialized through normal data loading
